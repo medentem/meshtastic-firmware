@@ -1,0 +1,15 @@
+{
+  "name": "Meshtastic Firmware (native)",
+  "user": "ubuntu",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "install": "./.cursor/install.sh",
+  "terminals": [
+    {
+      "name": "meshtasticd (SimRadio)",
+      "command": "mkdir -p /tmp/mesh-fs && cd /workspace && .pio/build/native/meshtasticd -s -d /tmp/mesh-fs -p 4403"
+    }
+  ],
+  "ports": [4403]
+}
