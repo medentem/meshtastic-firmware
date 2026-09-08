@@ -246,6 +246,15 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
     }
 #endif
 
+#if HAS_TRAFFIC_MANAGEMENT
+    // Deliver locally without TX when TMM says not to relay.
+    if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag && trafficManagementModule && !isToUs(p) && !isFromUs(p) &&
+        !trafficManagementModule->shouldRelay(*p)) {
+        LOG_DEBUG("Antispam: not relaying 0x%08x (relay budget / no-relay)", getFrom(p));
+        return true;
+    }
+#endif
+
     if (p->to == NODENUM_BROADCAST_NO_LORA)
         return false;
 
@@ -285,6 +294,8 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
                             tosend->hop_start = reduction <= tosend->hop_start ? tosend->hop_start - reduction : 0;
                             tosend->hop_limit = capped;
                         }
+                        if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag)
+                            trafficManagementModule->recordRelayed(*p);
                     }
 #endif
 

@@ -1904,6 +1904,10 @@ void TrafficManagementModule::clearAntispamAuxLocked(NodeNum node)
 {
     if (node == 0)
         return;
+    for (uint16_t i = 0; i < kNoRelayClaimEntries; i++) {
+        if (noRelayClaims[i].subject == node || noRelayClaims[i].attester == node)
+            memset(&noRelayClaims[i], 0, sizeof(NoRelayClaimCell));
+    }
     for (uint16_t i = 0; i < kVouchObsEntries; i++) {
         if (vouchObs[i].subject == node || vouchObs[i].attester == node)
             memset(&vouchObs[i], 0, sizeof(VouchObsCell));
@@ -2042,11 +2046,28 @@ bool TrafficManagementModule::isEstablishedForVouching(NodeNum node) const
     return !inProbationLocked(entry);
 }
 
+bool TrafficManagementModule::relayBudgetExempt(const meshtastic_MeshPacket &mp)
+{
+    if (mp.want_ack)
+        return true;
+    if (mp.which_payload_variant != meshtastic_MeshPacket_decoded_tag)
+        return true;
+    return mp.decoded.portnum == meshtastic_PortNum_ROUTING_APP || mp.decoded.portnum == meshtastic_PortNum_ADMIN_APP;
+}
+
+float TrafficManagementModule::currentCongestionPct() const
+{
+    if (s_testCongestionPct >= 0)
+        return static_cast<float>(s_testCongestionPct);
+    return airTime ? airTime->channelUtilizationPercent() : 0.0f;
+}
+
 bool TrafficManagementModule::noteFirstSeen(NodeNum node, uint8_t channel, uint8_t rssiClass, bool signedObserved)
 {
     if (node == 0)
         return false;
-    if (moduleConfig.traffic_management.probation_window_secs == 0)
+    const auto &cfg = moduleConfig.traffic_management;
+    if (cfg.probation_window_secs == 0 && cfg.relay_budget_max_packets == 0)
         return false;
 
     concurrency::LockGuard guard(&cacheLock);
@@ -2313,6 +2334,66 @@ bool TrafficManagementModule::peekPromotedForTest(NodeNum node)
     return entry && entry->promoted;
 }
 
+uint32_t TrafficManagementModule::peekRelayedCountForTest(NodeNum node)
+{
+    concurrency::LockGuard guard(&cacheLock);
+    const AntispamEntry *entry = findAntispamEntry(node);
+    return entry ? entry->relayedCount : 0;
+}
+
+bool TrafficManagementModule::peekNoRelayForTest(NodeNum node)
+{
+    concurrency::LockGuard guard(&cacheLock);
+    const AntispamEntry *entry = findAntispamEntry(node);
+    return entry && entry->noRelay;
+}
+
+bool TrafficManagementModule::peekNoRelayLocalForTest(NodeNum node)
+{
+    concurrency::LockGuard guard(&cacheLock);
+    const AntispamEntry *entry = findAntispamEntry(node);
+    return entry && entry->noRelayLocal;
+}
+
+void TrafficManagementModule::stampNoRelayClaimLocked(NodeNum attester, NodeNum subject, uint32_t nowMs)
+{
+    const uint8_t nowTick = currentRateTick();
+    NoRelayClaimCell *cell = nullptr;
+    NoRelayClaimCell *freeSlot = nullptr;
+    for (uint16_t i = 0; i < kNoRelayClaimEntries; i++) {
+        if (noRelayClaims[i].attester == attester && noRelayClaims[i].subject == subject) {
+            cell = &noRelayClaims[i];
+            break;
+        }
+        if (noRelayClaims[i].attester == 0 && !freeSlot)
+            freeSlot = &noRelayClaims[i];
+    }
+    if (!cell)
+        cell = freeSlot;
+    if (!cell)
+        return;
+    cell->attester = attester;
+    cell->subject = subject;
+    cell->windowTick = nowTick;
+    cell->claimMs = nowMs;
+}
+
+uint8_t TrafficManagementModule::noRelayClaimerCountLocked(NodeNum subject, uint32_t nowMs) const
+{
+    const auto &cfg = moduleConfig.traffic_management;
+    const uint8_t nowTick = currentRateTick();
+    uint8_t n = 0;
+    for (uint16_t i = 0; i < kNoRelayClaimEntries; i++) {
+        const NoRelayClaimCell &c = noRelayClaims[i];
+        if (c.attester == 0 || c.subject != subject || c.windowTick != nowTick)
+            continue;
+        if (cfg.no_relay_ttl_secs > 0 && Throttle::deadlinePassedAt(nowMs, c.claimMs + secsToMs(cfg.no_relay_ttl_secs)))
+            continue;
+        n++;
+    }
+    return n;
+}
+
 uint8_t TrafficManagementModule::relayHopCap(const meshtastic_MeshPacket &mp) const
 {
     const auto &cfg = moduleConfig.traffic_management;
@@ -2322,22 +2403,113 @@ uint8_t TrafficManagementModule::relayHopCap(const meshtastic_MeshPacket &mp) co
 
     bool changed = false;
     uint8_t cap = mp.hop_limit;
+    bool senderInProbation = false;
     {
         concurrency::LockGuard guard(&cacheLock);
         const uint8_t probationCap = cfg.probation_max_hop_limit;
         // No table means untrackable, not untracked: do not hop-cap every sender.
-        if (antispam && cfg.probation_window_secs > 0 && probationCap > 0 && probationCap < cap) {
+        if (antispam && cfg.probation_window_secs > 0) {
             const AntispamEntry *entry = findAntispamEntry(from);
-            const bool senderInProbation = hopCapAppliesLocked(entry);
-            if (senderInProbation) {
-                cap = probationCap;
-                changed = true;
-            }
+            senderInProbation = hopCapAppliesLocked(entry);
         }
-        if (changed)
-            incrementStatLocked(&stats.relay_hop_caps_applied);
+        if (senderInProbation && probationCap > 0 && probationCap < cap) {
+            cap = probationCap;
+            changed = true;
+        }
+    }
+    if (senderInProbation && cfg.congestion_hop_cap_pct > 0) {
+        const float util = currentCongestionPct();
+        if (util >= static_cast<float>(cfg.congestion_hop_cap_pct) && cap > 1) {
+            cap = 1;
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        concurrency::LockGuard guard(&cacheLock);
+        incrementStatLocked(&stats.relay_hop_caps_applied);
     }
     return cap;
+}
+
+bool TrafficManagementModule::shouldRelay(const meshtastic_MeshPacket &mp) const
+{
+    const auto &cfg = moduleConfig.traffic_management;
+    if (cfg.relay_budget_max_packets == 0)
+        return true;
+    const NodeNum from = getFrom(&mp);
+    if (from == 0 || from == nodeDB->getNodeNum())
+        return true;
+    if (relayBudgetExempt(mp))
+        return true;
+
+    concurrency::LockGuard guard(&cacheLock);
+    const AntispamEntry *entry = findAntispamEntry(from);
+    if (entry && entry->noRelay) {
+        incrementStatLocked(&stats.no_relay_skips);
+        return false;
+    }
+    return true;
+}
+
+void TrafficManagementModule::recordRelayed(const meshtastic_MeshPacket &mp)
+{
+    const auto &cfg = moduleConfig.traffic_management;
+    if (cfg.relay_budget_max_packets == 0)
+        return;
+    const NodeNum from = getFrom(&mp);
+    if (from == 0 || from == nodeDB->getNodeNum())
+        return;
+    if (relayBudgetExempt(mp))
+        return;
+
+    bool exhausted = false;
+    {
+        concurrency::LockGuard guard(&cacheLock);
+        AntispamEntry *entry = findAntispamEntry(from);
+        if (!entry || entry->noRelay)
+            return;
+
+        if (entry->relayedCount < 0x3F)
+            entry->relayedCount++;
+        exhausted = entry->relayedCount >= cfg.relay_budget_max_packets && !entry->noRelayLocal;
+        if (exhausted) {
+            entry->noRelay = true;
+            entry->noRelayLocal = true;
+            entry->noRelayClaimer = 0;
+            entry->noRelayClaimMs = 0;
+            TM_LOG_INFO("Antispam: relay budget exhausted for 0x%08x (>=%u), stopping relay this window", from,
+                        (unsigned)cfg.relay_budget_max_packets);
+        }
+    }
+    if (exhausted)
+        sendNoRelayGossip(from);
+}
+
+bool TrafficManagementModule::sendNoRelayGossip(NodeNum subject)
+{
+    if (!service)
+        return false;
+    meshtastic_IdAttestation att = meshtastic_IdAttestation_init_zero;
+    att.kind = meshtastic_IdAttestation_Kind_NO_RELAY;
+    att.subject = subject;
+    att.attester_tenure_secs = uptimeSecs();
+
+    meshtastic_MeshPacket *p = router ? router->allocForSending() : nullptr;
+    if (!p)
+        return false;
+    p->to = NODENUM_BROADCAST;
+    p->decoded.portnum = meshtastic_PortNum_ID_ATTESTATION_APP;
+    p->decoded.payload.size =
+        pb_encode_to_bytes(p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes), &meshtastic_IdAttestation_msg, &att);
+    p->decoded.want_response = false;
+    p->hop_limit = 1;
+    p->hop_start = 1;
+    p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
+    p->want_ack = false;
+    incrementStat(&stats.no_relay_gossips_sent);
+    service->sendToMesh(p);
+    return true;
 }
 
 bool TrafficManagementModule::sendKnownSinceGossip(NodeNum subject)
@@ -2372,6 +2544,7 @@ bool TrafficManagementModule::sendKnownSinceGossip(NodeNum subject)
 bool TrafficManagementModule::handleIdAttestation(const meshtastic_MeshPacket &mp)
 {
     const auto &cfg = moduleConfig.traffic_management;
+    const uint32_t nowMs = TrafficManagementModule::clockMs();
     meshtastic_IdAttestation att = meshtastic_IdAttestation_init_zero;
     if (mp.decoded.payload.size == 0 ||
         !pb_decode_from_bytes(mp.decoded.payload.bytes, mp.decoded.payload.size, &meshtastic_IdAttestation_msg, &att))
@@ -2394,56 +2567,109 @@ bool TrafficManagementModule::handleIdAttestation(const meshtastic_MeshPacket &m
             stampVouchObservationLocked(attesterNode, subj);
     };
 
-    if (att.kind != meshtastic_IdAttestation_Kind_KNOWN_SINCE)
-        return true;
-    if (cfg.probation_window_secs == 0)
-        return true;
-    if (!attesterObservedEnoughLocked(findAntispamEntry(attester), cfg.attestation_min_observed_secs))
-        return true;
-    if (!vouchWithinCapsLocked(attester, att.subject)) {
-        TM_LOG_DEBUG("Antispam: KNOWN_SINCE from 0x%08x for 0x%08x over vouch caps", attester, att.subject);
+    switch (att.kind) {
+    case meshtastic_IdAttestation_Kind_KNOWN_SINCE: {
+        if (cfg.probation_window_secs == 0)
+            break;
+        if (!attesterObservedEnoughLocked(findAntispamEntry(attester), cfg.attestation_min_observed_secs))
+            break;
+        if (!vouchWithinCapsLocked(attester, att.subject)) {
+            TM_LOG_DEBUG("Antispam: KNOWN_SINCE from 0x%08x for 0x%08x over vouch caps", attester, att.subject);
+            recordVouch(attester, att.subject);
+            break;
+        }
         recordVouch(attester, att.subject);
-        return true;
-    }
-    recordVouch(attester, att.subject);
-    if (attestationMinDistinctAttestersLocked() > 0) {
-        const AntispamEntry *attesterEntry = findAntispamEntry(attester);
-        const bool coLocated = attesterEntry != nullptr && attesterEntry->rssiClass != 0xFF &&
-                               attesterEntry->rssiClass == entry->rssiClass && attesterEntry->channel == entry->channel;
-        if (!coLocated)
-            stampAttestQuorumLocked(attester, att.subject);
-        else
-            TM_LOG_DEBUG("Antispam: KNOWN_SINCE from 0x%08x for 0x%08x discounted (co-located)", attester, att.subject);
-    }
-    if (entry->promoted) {
-        if (entry->promotedAtSecs != 0)
-            entry->promotedAtSecs = uptimeSecs();
+        if (attestationMinDistinctAttestersLocked() > 0) {
+            const AntispamEntry *attesterEntry = findAntispamEntry(attester);
+            const bool coLocated = attesterEntry != nullptr && attesterEntry->rssiClass != 0xFF &&
+                                   attesterEntry->rssiClass == entry->rssiClass && attesterEntry->channel == entry->channel;
+            if (!coLocated)
+                stampAttestQuorumLocked(attester, att.subject);
+            else
+                TM_LOG_DEBUG("Antispam: KNOWN_SINCE from 0x%08x for 0x%08x discounted (co-located)", attester, att.subject);
+        }
+        if (entry->promoted) {
+            if (entry->promotedAtSecs != 0)
+                entry->promotedAtSecs = uptimeSecs();
+            if (entry->trustLevel == 1 && l2VouchEligibleLocked(entry, attester, mp.xeddsa_signed)) {
+                entry->trustLevel = 2;
+                TM_LOG_INFO("Antispam: 0x%08x re-raised to neighbor-attested by verified signer 0x%08x", att.subject, attester);
+            }
+            break;
+        }
+        if (!entry->hasFirstSeen)
+            break;
+        const uint32_t requiredAttesters = attestationMinDistinctAttestersLocked();
+        if (requiredAttesters > 0) {
+            const uint8_t quorum = attestQuorumCountLocked(att.subject);
+            if (quorum < requiredAttesters) {
+                TM_LOG_DEBUG("Antispam: KNOWN_SINCE for 0x%08x from 0x%08x below the %u distinct-attester threshold (%u)",
+                             att.subject, attester, (unsigned)requiredAttesters, (unsigned)quorum);
+                break;
+            }
+        }
+        entry->promoted = true;
         if (entry->trustLevel == 1 && l2VouchEligibleLocked(entry, attester, mp.xeddsa_signed)) {
             entry->trustLevel = 2;
-            TM_LOG_INFO("Antispam: 0x%08x re-raised to neighbor-attested by verified signer 0x%08x", att.subject, attester);
+            TM_LOG_INFO("Antispam: 0x%08x raised to neighbor-attested by verified signer 0x%08x", att.subject, attester);
         }
-        return true;
+        entry->promotedAtSecs = (cfg.attestation_promotion_ttl_secs > 0) ? uptimeSecs() : 0;
+        incrementStatLocked(&stats.attestation_promotions);
+        TM_LOG_INFO("Antispam: promoted 0x%08x via KNOWN_SINCE from 0x%08x (quorum %u)", att.subject, attester,
+                    (unsigned)attestQuorumCountLocked(att.subject));
+        break;
     }
-    if (!entry->hasFirstSeen)
-        return true;
-    const uint32_t requiredAttesters = attestationMinDistinctAttestersLocked();
-    if (requiredAttesters > 0) {
-        const uint8_t quorum = attestQuorumCountLocked(att.subject);
-        if (quorum < requiredAttesters) {
-            TM_LOG_DEBUG("Antispam: KNOWN_SINCE for 0x%08x from 0x%08x below the %u distinct-attester threshold (%u)",
-                         att.subject, attester, (unsigned)requiredAttesters, (unsigned)quorum);
-            return true;
+    case meshtastic_IdAttestation_Kind_NO_RELAY: {
+        if (cfg.relay_budget_max_packets == 0)
+            break;
+        if (!attesterObservedEnoughLocked(findAntispamEntry(attester), cfg.attestation_min_observed_secs))
+            break;
+        if (cfg.no_relay_requires_local_exhaustion > 0 && entry->relayedCount == 0 && !entry->noRelayLocal)
+            break;
+        if (entry->noRelay) {
+            if (entry->noRelayLocal)
+                break;
+            if (entry->noRelayClaimer != 0 && entry->noRelayClaimer == attester && cfg.no_relay_ttl_secs > 0 &&
+                Throttle::deadlinePassedAt(nowMs, entry->noRelayClaimMs + secsToMs(cfg.no_relay_ttl_secs))) {
+                entry->noRelayClaimMs = nowMs;
+            }
+            stampNoRelayClaimLocked(attester, att.subject, nowMs);
+            break;
         }
+        if (cfg.no_relay_max_subjects_per_window > 0) {
+            uint8_t claimerSubjects = 0;
+            bool alreadyClaimed = false;
+            const uint8_t nowTick = currentRateTick();
+            for (uint16_t i = 0; i < kNoRelayClaimEntries; i++) {
+                const NoRelayClaimCell &c = noRelayClaims[i];
+                if (c.attester != attester || c.windowTick != nowTick)
+                    continue;
+                if (cfg.no_relay_ttl_secs > 0 && Throttle::deadlinePassedAt(nowMs, c.claimMs + secsToMs(cfg.no_relay_ttl_secs)))
+                    continue;
+                if (c.subject == att.subject)
+                    alreadyClaimed = true;
+                else
+                    claimerSubjects++;
+            }
+            if (!alreadyClaimed && claimerSubjects >= cfg.no_relay_max_subjects_per_window)
+                break;
+        }
+        stampNoRelayClaimLocked(attester, att.subject, nowMs);
+        const uint32_t minClaimers = cfg.no_relay_min_claimers;
+        const bool quorumMet = minClaimers == 0 || noRelayClaimerCountLocked(att.subject, nowMs) >= minClaimers;
+        if (entry->noRelayLocal || quorumMet) {
+            entry->noRelay = true;
+            if (!entry->noRelayLocal) {
+                entry->noRelayClaimer = attester;
+                entry->noRelayClaimMs = nowMs;
+            }
+            TM_LOG_INFO("Antispam: NO_RELAY for 0x%08x from 0x%08x", att.subject, attester);
+        }
+        break;
     }
-    entry->promoted = true;
-    if (entry->trustLevel == 1 && l2VouchEligibleLocked(entry, attester, mp.xeddsa_signed)) {
-        entry->trustLevel = 2;
-        TM_LOG_INFO("Antispam: 0x%08x raised to neighbor-attested by verified signer 0x%08x", att.subject, attester);
+    default:
+        break;
     }
-    entry->promotedAtSecs = (cfg.attestation_promotion_ttl_secs > 0) ? uptimeSecs() : 0;
-    incrementStatLocked(&stats.attestation_promotions);
-    TM_LOG_INFO("Antispam: promoted 0x%08x via KNOWN_SINCE from 0x%08x (quorum %u)", att.subject, attester,
-                (unsigned)attestQuorumCountLocked(att.subject));
     return true;
 }
 
@@ -2505,6 +2731,11 @@ void TrafficManagementModule::maintainAntispamLocked()
             e.windowTick = nowRateTick;
         } else if ((static_cast<uint8_t>(nowRateTick - e.windowTick) & 0x0F) >= 1) {
             e.windowTick = nowRateTick;
+            e.relayedCount = 0;
+            e.noRelay = false;
+            e.noRelayLocal = false;
+            e.noRelayClaimer = 0;
+            e.noRelayClaimMs = 0;
         }
         if (e.promoted && e.promotedAtSecs != 0 && promoTtl > 0) {
             const uint32_t age = (nowSecs >= e.promotedAtSecs) ? (nowSecs - e.promotedAtSecs) : 0;
@@ -2529,6 +2760,10 @@ void TrafficManagementModule::maintainAntispamLocked()
     for (uint16_t i = 0; i < kAttestQuorumEntries; i++) {
         if (attestQuorum[i].attester != 0 && (static_cast<uint8_t>(nowRateTick - attestQuorum[i].windowTick) & 0x0F) >= 1)
             memset(&attestQuorum[i], 0, sizeof(AttestQuorumCell));
+    }
+    for (uint16_t i = 0; i < kNoRelayClaimEntries; i++) {
+        if (noRelayClaims[i].attester != 0 && (static_cast<uint8_t>(nowRateTick - noRelayClaims[i].windowTick) & 0x0F) >= 1)
+            memset(&noRelayClaims[i], 0, sizeof(NoRelayClaimCell));
     }
 }
 
