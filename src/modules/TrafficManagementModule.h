@@ -108,8 +108,10 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     /// are treated as in-probation while probation is enabled.
     uint8_t relayHopCap(const meshtastic_MeshPacket &mp) const;
 
-    /// 0 anonymous, 1 signed; untracked is 0.
+    /// 0 anonymous, 1 signed, 2 neighbor-attested; untracked is 0.
     uint8_t trustLevelForTest(NodeNum node);
+    /// Pin last-signed uptime for tests.
+    void setLastSignedSecsForTest(NodeNum node, uint32_t secs);
 
     /// -1 untracked, 0 established, 1 in-probation.
     int peekProbationStateForTest(NodeNum node);
@@ -357,7 +359,7 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
         uint32_t promotedAtSecs; // uptime when the promotion lease was armed; 0 = permanent
         uint8_t windowTick;      // 5-min nibble clock; valid when hasWindow
         uint8_t promoted : 1;
-        uint8_t trustLevel : 2; // 0 anonymous, 1 signed
+        uint8_t trustLevel : 2; // 0 anonymous, 1 signed, 2 neighbor-attested
         uint8_t hasFirstSeen : 1;
         uint8_t hasLastSigned : 1;
         uint8_t hasWindow : 1;
@@ -401,6 +403,10 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     uint8_t attestQuorumCountLocked(NodeNum subject) const;
     /// Configured distinct-attester floor for ending probation.
     uint32_t attestationMinDistinctAttestersLocked() const;
+    /// Minimum observed tenure before an L2 (neighbor-attested) upgrade.
+    uint32_t l2FloorSecs() const;
+    /// True when `attester` may raise `subject` to L2.
+    bool l2VouchEligibleLocked(const AntispamEntry *subject, NodeNum attester, bool signedObserved) const;
     /// Uptime seconds; tests may pin this via s_testUptimeSecs.
     uint32_t uptimeSecs() const;
     /// Quantize packet RSSI into a 4-class bucket.
