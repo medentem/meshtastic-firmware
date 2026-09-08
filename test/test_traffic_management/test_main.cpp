@@ -4743,7 +4743,7 @@ static void test_tm_groupBudget_poolFiresWhenRateLimitZero(void)
 
     constexpr uint32_t kPerMember = default_traffic_mgmt_group_budget_pool / 5;
     ProcessMessage last = ProcessMessage::CONTINUE;
-    for (uint32_t i = 0; i < kPerMember + 1; i++) {
+    for (uint32_t i = 0; i < kPerMember; i++) {
         meshtastic_MeshPacket txt = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kRemoteNode);
         txt.id = 0x4600 + i;
         last = module.handleReceived(txt);
