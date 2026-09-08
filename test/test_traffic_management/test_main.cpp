@@ -4409,6 +4409,37 @@ static void test_tm_trustLadder_tenureCappedL2Upgrade(void)
     TrafficManagementModule::s_testNowMs = baseNowMs;
 }
 
+static void test_tm_trustLadder_manualKeyL3Permanent(void)
+{
+    const uint32_t baseNowMs = TrafficManagementModule::s_testNowMs;
+    TrafficManagementModule::s_testNowMs = baseNowMs + 300'000;
+
+    TrafficManagementModuleTestShim module;
+    moduleConfig.traffic_management.probation_window_secs = 600;
+
+    uint8_t key[32];
+    memset(key, 0x77, sizeof(key));
+
+    module.onNodeKeyCommitted(kRemoteNode3, key, /*proven=*/false);
+    TEST_ASSERT_EQUAL_UINT8(0, module.trustLevelForTest(kRemoteNode3));
+
+    module.onNodeKeyCommitted(kRemoteNode3, key, /*proven=*/true);
+    TEST_ASSERT_EQUAL_UINT8(3, module.trustLevelForTest(kRemoteNode3));
+    TEST_ASSERT_EQUAL_INT(0, module.peekProbationStateForTest(kRemoteNode3));
+
+    TrafficManagementModule::s_testNowMs += 4 * 300'000;
+    (void)module.runOnce();
+    (void)module.runOnce();
+    TEST_ASSERT_EQUAL_UINT8(3, module.trustLevelForTest(kRemoteNode3));
+
+    module.onNodeKeyCommitted(kRemoteNode3, key, /*proven=*/true);
+    TEST_ASSERT_EQUAL_UINT8(3, module.trustLevelForTest(kRemoteNode3));
+
+    module.handleReceived(makePositionPacket(kRemoteNode3, 374221234, -1220845678));
+    TEST_ASSERT_EQUAL_UINT8(3, module.trustLevelForTest(kRemoteNode3));
+    TrafficManagementModule::s_testNowMs = baseNowMs;
+}
+
 } // namespace
 
 void setUp(void)
@@ -4567,6 +4598,7 @@ TM_TEST_ENTRY void setup()
     RUN_TEST(test_tm_trustLadder_l2FastPathDecayAndRenewal);
     RUN_TEST(test_tm_trustLadder_l2SignatureRequiredMixedMeshFallback);
     RUN_TEST(test_tm_trustLadder_tenureCappedL2Upgrade);
+    RUN_TEST(test_tm_trustLadder_manualKeyL3Permanent);
     exit(UNITY_END());
 }
 
