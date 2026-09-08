@@ -1997,6 +1997,18 @@ bool TrafficManagementModule::inProbationLocked(const AntispamEntry *entry) cons
     return observedAgeSecsLocked(entry) < windowSecs;
 }
 
+bool TrafficManagementModule::hopCapAppliesLocked(const AntispamEntry *entry) const
+{
+    const uint32_t windowSecs = moduleConfig.traffic_management.probation_window_secs;
+    if (windowSecs == 0)
+        return false;
+    if (!entry || !entry->hasFirstSeen)
+        return true;
+    if (entry->trustLevel >= 2)
+        return false;
+    return observedAgeSecsLocked(entry) < windowSecs;
+}
+
 bool TrafficManagementModule::inProbation(NodeNum node) const
 {
     if (node == 0)
@@ -2304,7 +2316,7 @@ uint8_t TrafficManagementModule::relayHopCap(const meshtastic_MeshPacket &mp) co
         // No table means untrackable, not untracked: do not hop-cap every sender.
         if (antispam && cfg.probation_window_secs > 0 && probationCap > 0 && probationCap < cap) {
             const AntispamEntry *entry = findAntispamEntry(from);
-            const bool senderInProbation = !entry || !entry->hasFirstSeen || inProbationLocked(entry);
+            const bool senderInProbation = hopCapAppliesLocked(entry);
             if (senderInProbation) {
                 cap = probationCap;
                 changed = true;

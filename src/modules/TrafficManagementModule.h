@@ -104,8 +104,8 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
         return exhaustRequested && exhaustRequestedFrom == getFrom(&mp) && exhaustRequestedId == mp.id;
     }
 
-    /// hop_limit for the relayed copy: min(original, probation cap). Untracked senders
-    /// are treated as in-probation while probation is enabled.
+    /// hop_limit for the relayed copy: min(original, probation cap). Untracked
+    /// senders stay capped; unsigned promotion does not lift the cap.
     uint8_t relayHopCap(const meshtastic_MeshPacket &mp) const;
 
     /// 0 anonymous, 1 signed, 2 neighbor-attested; untracked is 0.
@@ -381,6 +381,8 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     bool inProbation(NodeNum node) const;
     /// True while first-seen age is still inside probation_window_secs.
     bool inProbationLocked(const AntispamEntry *entry) const;
+    /// Hop cap ignores unsigned `promoted`; tenure or trustLevel>=2 lifts it.
+    bool hopCapAppliesLocked(const AntispamEntry *entry) const;
     /// Seconds since first-seen, or 0 if untracked. Caller must hold cacheLock.
     uint32_t observedAgeSecsLocked(const AntispamEntry *entry) const;
     /// True when the attester has been observed locally for at least `minSecs`.
