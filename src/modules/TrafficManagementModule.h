@@ -108,6 +108,9 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     /// are treated as in-probation while probation is enabled.
     uint8_t relayHopCap(const meshtastic_MeshPacket &mp) const;
 
+    /// 0 anonymous, 1 signed; untracked is 0.
+    uint8_t trustLevelForTest(NodeNum node);
+
     /// -1 untracked, 0 established, 1 in-probation.
     int peekProbationStateForTest(NodeNum node);
     /// Vouch count for (attester, subject) this window.
@@ -345,20 +348,23 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     bool nodeInfoSeeded = false;
     uint8_t sweepsSinceNodeInfoReconcile = 0;
 
-    /// Per-node greylist state. Separate from the 10-byte unified cache:
-    /// first-seen uptime and promotion need real fields.
+    /// Per-node greylist / signed-identity state. Separate from the 10-byte
+    /// unified cache: first-seen uptime and last-signed need real fields.
     struct __attribute__((packed)) AntispamEntry {
         NodeNum node;
         uint32_t firstSeenSecs;  // uptime seconds; valid when hasFirstSeen
+        uint32_t lastSignedSecs; // uptime of last verified signature; valid when hasLastSigned
         uint32_t promotedAtSecs; // uptime when the promotion lease was armed; 0 = permanent
         uint8_t windowTick;      // 5-min nibble clock; valid when hasWindow
         uint8_t promoted : 1;
+        uint8_t trustLevel : 2; // 0 anonymous, 1 signed
         uint8_t hasFirstSeen : 1;
+        uint8_t hasLastSigned : 1;
         uint8_t hasWindow : 1;
         uint8_t rssiClass;
         uint8_t channel;
     };
-    static_assert(sizeof(AntispamEntry) == 16, "AntispamEntry should be 16 bytes");
+    static_assert(sizeof(AntispamEntry) == 20, "AntispamEntry should be 20 bytes");
 
     /// Compiled antispam table size (min of unified cache and ANTISPAM_CACHE_SIZE).
     static constexpr uint16_t antispamCacheSize()
@@ -377,8 +383,8 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     uint32_t observedAgeSecsLocked(const AntispamEntry *entry) const;
     /// True when the attester has been observed locally for at least `minSecs`.
     bool attesterObservedEnoughLocked(const AntispamEntry *attesterEntry, uint32_t minSecs) const;
-    /// Record first-seen for `node`.
-    bool noteFirstSeen(NodeNum node, uint8_t channel, uint8_t rssiClass);
+    /// Record first-seen (and optional signed observation) for `node`.
+    bool noteFirstSeen(NodeNum node, uint8_t channel, uint8_t rssiClass, bool signedObserved);
     /// True when local observation is old enough to vouch for others.
     bool isEstablishedForVouching(NodeNum node) const;
     /// Emit a hop_limit=1 KNOWN_SINCE gossip for `subject`.

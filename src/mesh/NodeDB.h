@@ -16,6 +16,7 @@
 #include "configuration.h"
 #include "mesh-pb-constants.h"
 #include "mesh/generated/meshtastic/mesh.pb.h" // For CriticalErrorCode
+#include <ErriezCRC32.h>                       // crc32Buffer: key-derived nodenum dual-read
 
 #if ARCH_PORTDUINO
 #include "PortduinoGlue.h"
@@ -825,7 +826,10 @@ extern uint32_t error_address;
 // Use this instead of `if (snr_q4)`. Legacy records (bit clear) are unambiguously "unknown".
 #define NODEINFO_BITFIELD_HAS_SNR_SHIFT 10
 #define NODEINFO_BITFIELD_HAS_SNR_MASK (1u << NODEINFO_BITFIELD_HAS_SNR_SHIFT)
-// Bits 11..31 reserved for future single-bit flags.
+// Stored 32-byte key derives this node number (crc32). Dual-read recomputes; refuse a non-deriving replacement.
+#define NODEINFO_BITFIELD_IS_KEY_DERIVED_IDENTITY_SHIFT 11
+#define NODEINFO_BITFIELD_IS_KEY_DERIVED_IDENTITY_MASK (1u << NODEINFO_BITFIELD_IS_KEY_DERIVED_IDENTITY_SHIFT)
+// Bits 12..31 reserved for future single-bit flags.
 
 // Convenience accessors so call sites read like the old struct fields.
 inline bool nodeInfoLiteHasUser(const meshtastic_NodeInfoLite *n)
@@ -874,11 +878,39 @@ inline bool nodeInfoLiteHasSnr(const meshtastic_NodeInfoLite *n)
 {
     return n && (n->bitfield & NODEINFO_BITFIELD_HAS_SNR_MASK);
 }
+/// True when the stored bitfield marks a key-derived identity.
+inline bool nodeInfoLiteIsKeyDerivedIdentity(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_IS_KEY_DERIVED_IDENTITY_MASK);
+}
 /// A node that the eviction/migration paths must not drop: a favourite, an
 /// ignored (blocked) node, or a manually-verified key.
 inline bool nodeInfoLiteIsProtected(const meshtastic_NodeInfoLite *n)
 {
     return nodeInfoLiteIsFavorite(n) || nodeInfoLiteIsIgnored(n) || nodeInfoLiteIsKeyManuallyVerified(n);
+}
+
+/// Dual-read: recompute nodenum from the key rather than trusting the persisted bit.
+inline bool identityKeyDerivesNodeNum(const uint8_t *key32, NodeNum num)
+{
+    return key32 != nullptr && crc32Buffer(key32, 32) == num;
+}
+/// True when the stored 32-byte key derives this node's own number.
+inline bool storedIdentityIsKeyDerived(const meshtastic_NodeInfoLite *n)
+{
+    return n && n->public_key.size == 32 && identityKeyDerivesNodeNum(n->public_key.bytes, n->num);
+}
+/// True when the incoming 32-byte key would derive `num`.
+inline bool incomingKeyDerivesNodeNum(const meshtastic_User &user, NodeNum num)
+{
+    return user.public_key.size == 32 && identityKeyDerivesNodeNum(user.public_key.bytes, num);
+}
+/// A key-derived stored key may only be replaced by a deriving key; keyless incoming is not a claim.
+inline bool incomingKeyMayBindIdentity(const meshtastic_NodeInfoLite *stored, const meshtastic_User &incoming, NodeNum num)
+{
+    if (!storedIdentityIsKeyDerived(stored))
+        return true;
+    return incoming.public_key.size != 32 || incomingKeyDerivesNodeNum(incoming, num);
 }
 
 inline void nodeInfoLiteSetBit(meshtastic_NodeInfoLite *n, uint32_t mask, bool value)

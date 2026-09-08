@@ -3676,6 +3676,14 @@ bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelInde
         return false;
     }
 
+    // Once the stored key derives this node's number, a different non-deriving key cannot replace it.
+    if (info->public_key.size == 32 && p.public_key.size == 32 && memcmp(info->public_key.bytes, p.public_key.bytes, 32) != 0 &&
+        !incomingKeyMayBindIdentity(info, p, nodeId)) {
+        LOG_WARN("Refuse identity update for 0x%08x: stored key is key-derived and the new key does not derive the number",
+                 nodeId);
+        return false;
+    }
+
 #if !(MESHTASTIC_EXCLUDE_PKI)
     if (p.public_key.size == 32 && nodeId != nodeDB->getNodeNum()) {
         printBytes("Incoming Pubkey: ", p.public_key.bytes, 32);
@@ -4196,6 +4204,7 @@ void NodeDB::commitRemoteKey(NodeNum n, const uint8_t key32[32], KeyCommitTrust 
     // meant to establish or rotate a key. Keep new call sites to that same trust bar.
     memcpy(info->public_key.bytes, key, 32);
     info->public_key.size = 32;
+    nodeInfoLiteSetBit(info, NODEINFO_BITFIELD_IS_KEY_DERIVED_IDENTITY_MASK, identityKeyDerivesNodeNum(key, n));
 
 #if HAS_TRAFFIC_MANAGEMENT
     // Write-through, mirroring updateUser()'s identity hook: without it the TrafficManagement
