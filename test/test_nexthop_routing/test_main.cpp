@@ -1080,6 +1080,15 @@ void test_rebroadcast_noRelay_skipsTxButNotToUs(void)
     meshtastic_MeshPacket routing = makeBehaviorPacket(meshtastic_PortNum_ROUTING_APP, kRemoteNode, NODENUM_BROADCAST, 0);
     TEST_ASSERT_TRUE(shim->perhapsRebroadcast(&routing));
     TEST_ASSERT_EQUAL_MESSAGE(1, mockIface->sendCount, "ROUTING still relays under NO_RELAY");
+
+    meshtastic_MeshPacket ack = makeBehaviorPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kRemoteNode, NODENUM_BROADCAST, 0, true);
+    TEST_ASSERT_TRUE_MESSAGE(shim->perhapsRebroadcast(&ack), "want_ack TEXT under NO_RELAY is consumed locally");
+    TEST_ASSERT_EQUAL_MESSAGE(1, mockIface->sendCount, "want_ack TEXT must not TX under NO_RELAY");
+
+    meshtastic_MeshPacket opaque = makeRebroadcastCandidate(NODENUM_BROADCAST);
+    opaque.id = 0x0BADF11D;
+    TEST_ASSERT_FALSE_MESSAGE(shim->relayOpaquePacket(&opaque), "NO_RELAY opaque must not TX");
+    TEST_ASSERT_EQUAL_MESSAGE(1, mockIface->sendCount, "opaque flood must not TX under NO_RELAY");
 }
 #endif
 

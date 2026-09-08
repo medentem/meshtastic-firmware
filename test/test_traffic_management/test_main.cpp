@@ -4485,7 +4485,9 @@ static void test_tm_noRelay_observedOverRelay_onlyPath(void)
     TEST_ASSERT_TRUE(module.shouldRelay(admin));
     meshtastic_MeshPacket ack = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kTargetNode);
     ack.want_ack = true;
-    TEST_ASSERT_TRUE(module.shouldRelay(ack));
+    TEST_ASSERT_FALSE(module.shouldRelay(ack));
+    meshtastic_MeshPacket opaque = makeUnknownPacket(kTargetNode);
+    TEST_ASSERT_FALSE(module.shouldRelay(opaque));
 
     trackSender(module, kRemoteNode3);
     module.recordRelayed(makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kRemoteNode3));
@@ -4494,6 +4496,21 @@ static void test_tm_noRelay_observedOverRelay_onlyPath(void)
     module.recordRelayed(makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kRemoteNode3));
     TEST_ASSERT_EQUAL_UINT32(4, module.peekRelayedCountForTest(kRemoteNode3));
     TEST_ASSERT_TRUE(module.peekNoRelayLocalForTest(kRemoteNode3));
+    meshtastic_MeshPacket wantAck = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kRemoteNode3);
+    wantAck.want_ack = true;
+    TEST_ASSERT_FALSE(module.shouldRelay(wantAck));
+    TEST_ASSERT_FALSE(module.shouldRelay(makeUnknownPacket(kRemoteNode3)));
+    TEST_ASSERT_TRUE(module.shouldRelay(makeDecodedPacket(meshtastic_PortNum_ROUTING_APP, kRemoteNode3)));
+    TEST_ASSERT_TRUE(module.shouldRelay(makeDecodedPacket(meshtastic_PortNum_ADMIN_APP, kRemoteNode3)));
+
+    constexpr NodeNum kOpaqueOnly = 0x0A0A0A0A;
+    module.recordRelayed(makeUnknownPacket(kOpaqueOnly));
+    module.recordRelayed(makeUnknownPacket(kOpaqueOnly));
+    module.recordRelayed(makeUnknownPacket(kOpaqueOnly));
+    module.recordRelayed(makeUnknownPacket(kOpaqueOnly));
+    TEST_ASSERT_TRUE(module.peekNoRelayLocalForTest(kOpaqueOnly));
+    TEST_ASSERT_FALSE(module.shouldRelay(makeUnknownPacket(kOpaqueOnly)));
+
     meshtastic_MeshPacket att4 = makeAttestationPacket(meshtastic_IdAttestation_Kind_NO_RELAY, kRemoteNode3, kRemoteNode, 0);
     ProcessMessage r4 = module.handleReceived(att4);
     TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(r4));

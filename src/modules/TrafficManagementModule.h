@@ -409,7 +409,7 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     bool noteFirstSeen(NodeNum node, uint8_t channel, uint8_t rssiClass, bool signedObserved);
     /// True when local observation is old enough to vouch for others.
     bool isEstablishedForVouching(NodeNum node) const;
-    /// True for want_ack / ROUTING_APP / ADMIN_APP (always rebroadcast).
+    /// True for ROUTING_APP / ADMIN_APP (always rebroadcast). want_ack and opaque frames are charged.
     static bool relayBudgetExempt(const meshtastic_MeshPacket &mp);
     /// Channel utilization percent, or s_testCongestionPct when pinned.
     float currentCongestionPct() const;

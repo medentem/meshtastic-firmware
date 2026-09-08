@@ -2048,10 +2048,8 @@ bool TrafficManagementModule::isEstablishedForVouching(NodeNum node) const
 
 bool TrafficManagementModule::relayBudgetExempt(const meshtastic_MeshPacket &mp)
 {
-    if (mp.want_ack)
-        return true;
     if (mp.which_payload_variant != meshtastic_MeshPacket_decoded_tag)
-        return true;
+        return false;
     return mp.decoded.portnum == meshtastic_PortNum_ROUTING_APP || mp.decoded.portnum == meshtastic_PortNum_ADMIN_APP;
 }
 
@@ -2467,6 +2465,8 @@ void TrafficManagementModule::recordRelayed(const meshtastic_MeshPacket &mp)
     {
         concurrency::LockGuard guard(&cacheLock);
         AntispamEntry *entry = findAntispamEntry(from);
+        if (!entry)
+            entry = findOrCreateAntispamEntry(from, nullptr);
         if (!entry || entry->noRelay)
             return;
 
