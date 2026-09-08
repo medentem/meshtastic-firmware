@@ -41,6 +41,9 @@
 class TrafficManagementModule : public MeshModule, private concurrency::OSThread
 {
   public:
+    /// DeviceMetrics.top_senders slots (must match the protobuf max_count).
+    static constexpr uint16_t kTopSendersCount = 3;
+
     TrafficManagementModule();
     ~TrafficManagementModule();
 
@@ -114,6 +117,11 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     /// Charge one rebroadcast to the sender's relay budget; may gossip NO_RELAY.
     void recordRelayed(const meshtastic_MeshPacket &mp);
 
+    /// Fill `out` with this window's top senders (node=0 if unused).
+    void snapshotTopSenders(meshtastic_TopSender (&out)[kTopSendersCount]) const;
+    /// Ingest a neighbor's top-sender samples. No-op when budget gossip is off.
+    void ingestNeighborTopSenders(NodeNum neighbor, const meshtastic_TopSender *entries, pb_size_t count);
+
     /// 0 anonymous, 1 signed, 2 neighbor-attested, 3 manual; untracked is 0.
     uint8_t trustLevelForTest(NodeNum node);
     /// Pin last-signed uptime for tests.
@@ -139,6 +147,10 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     bool peekNoRelayForTest(NodeNum node);
     /// True when NO_RELAY came from local budget exhaustion.
     bool peekNoRelayLocalForTest(NodeNum node);
+    /// 0 if tracked; -1 if not. Writes the neighbor-sample median into `medianOut`.
+    int peekSenderBudgetForTest(NodeNum sender, uint32_t *medianOut = nullptr);
+    /// Group budget for a channel×RSSI class this window, or 0.
+    uint32_t groupBudgetForTest(uint8_t channel, uint8_t rssiClass);
     /// 0xFFFFFFFF = production (Time::getUptimeSecs() or test clock); otherwise the stored value.
     inline static uint32_t s_testUptimeSecs = 0xFFFFFFFFu;
     /// Pin antispam uptime for tests; pass 0xFFFFFFFF to restore production.
@@ -372,6 +384,7 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
         uint32_t promotedAtSecs; // uptime when the promotion lease was armed; 0 = permanent
         NodeNum noRelayClaimer;  // last gossip attester; 0 = local exhaustion
         uint32_t noRelayClaimMs;
+        NodeNum budgetSampleMark[3];
         uint8_t relayedCount;
         uint8_t windowTick; // 5-min nibble clock; valid when hasWindow
         uint8_t promoted : 1;
@@ -381,10 +394,12 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
         uint8_t hasFirstSeen : 1;
         uint8_t hasLastSigned : 1;
         uint8_t hasWindow : 1;
+        uint8_t budgetSampleCount;
+        uint8_t budgetSamples[3];
         uint8_t rssiClass;
         uint8_t channel;
     };
-    static_assert(sizeof(AntispamEntry) == 29, "AntispamEntry should be 29 bytes");
+    static_assert(sizeof(AntispamEntry) == 45, "AntispamEntry should be 45 bytes");
 
     /// Compiled antispam table size (min of unified cache and ANTISPAM_CACHE_SIZE).
     static constexpr uint16_t antispamCacheSize()
@@ -437,6 +452,18 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     void stampNoRelayClaimLocked(NodeNum attester, NodeNum subject, uint32_t nowMs);
     /// Distinct live NO_RELAY claimers for `subject` (TTL-aware).
     uint8_t noRelayClaimerCountLocked(NodeNum subject, uint32_t nowMs) const;
+    /// Effective rate threshold for `sender` (lock wrapper).
+    uint32_t effectiveRateThreshold(NodeNum sender) const;
+    /// Rate threshold including probation group budget and neighbor-median raise.
+    uint32_t effectiveRateThresholdLocked(NodeNum sender) const;
+    /// Note channel×RSSI co-occurrence for group-budget tracking.
+    bool observeGroupCooccurrence(NodeNum node, uint8_t channel, uint8_t rssiClass);
+    /// True when this node's channel×RSSI class is currently flagged.
+    bool isInFlaggedGroup(NodeNum node, uint8_t channel, uint8_t rssiClass) const;
+    /// Flagged-group test with channel×RSSI already resolved.
+    bool isInFlaggedGroupLocked(uint8_t channel, uint8_t rssiClass) const;
+    /// Group relay budget for this channel×RSSI class.
+    uint32_t groupBudgetLocked(uint8_t channel, uint8_t rssiClass) const;
     /// Uptime seconds; tests may pin this via s_testUptimeSecs.
     uint32_t uptimeSecs() const;
     /// Quantize packet RSSI into a 4-class bucket.
@@ -479,6 +506,18 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
         uint32_t claimMs;
     };
     NoRelayClaimCell noRelayClaims[kNoRelayClaimEntries] = {};
+
+    static constexpr uint16_t kGroupObsEntries = 16;
+    struct GroupObsCell {
+        uint8_t channel;
+        uint8_t rssiClass;
+        uint8_t windowTick;
+        uint8_t freshCount;
+        uint8_t inUse;
+        uint8_t flagged;
+    };
+    GroupObsCell groupObs[kGroupObsEntries] = {};
+    uint32_t groupMedian[kGroupObsEntries] = {};
 
     uint32_t lastVouchSentMs = 0;
 

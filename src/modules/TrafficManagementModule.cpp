@@ -1244,7 +1244,9 @@ ProcessMessage TrafficManagementModule::handleReceived(const meshtastic_MeshPack
 
         // Antispam: track LoRa arrivals even if via_mqtt is set (that bit is unauthenticated).
         if (arrivedViaRadio(mp)) {
-            noteFirstSeen(mp.from, static_cast<uint8_t>(mp.channel), rssiClassOf(mp), mp.xeddsa_signed);
+            if (noteFirstSeen(mp.from, static_cast<uint8_t>(mp.channel), rssiClassOf(mp), mp.xeddsa_signed)) {
+                observeGroupCooccurrence(mp.from, static_cast<uint8_t>(mp.channel), rssiClassOf(mp));
+            }
         }
         if (mp.decoded.portnum == meshtastic_PortNum_ID_ATTESTATION_APP) {
             if (handleIdAttestation(mp)) {
@@ -1786,7 +1788,7 @@ bool TrafficManagementModule::isRateLimited(NodeNum from, uint32_t nowMs)
         entry->setRateCount(static_cast<uint8_t>(currentCount + 1));
 
     // Threshold capped at 60 so a saturated reading (63) always exceeds it.
-    uint32_t threshold = moduleConfig.traffic_management.rate_limit_max_packets;
+    uint32_t threshold = effectiveRateThresholdLocked(from);
     if (threshold > 60)
         threshold = 60;
 
@@ -2065,7 +2067,7 @@ bool TrafficManagementModule::noteFirstSeen(NodeNum node, uint8_t channel, uint8
     if (node == 0)
         return false;
     const auto &cfg = moduleConfig.traffic_management;
-    if (cfg.probation_window_secs == 0 && cfg.relay_budget_max_packets == 0)
+    if (cfg.probation_window_secs == 0 && cfg.group_budget_enabled == 0 && cfg.relay_budget_max_packets == 0)
         return false;
 
     concurrency::LockGuard guard(&cacheLock);
@@ -2351,6 +2353,155 @@ bool TrafficManagementModule::peekNoRelayLocalForTest(NodeNum node)
     concurrency::LockGuard guard(&cacheLock);
     const AntispamEntry *entry = findAntispamEntry(node);
     return entry && entry->noRelayLocal;
+}
+
+uint32_t TrafficManagementModule::effectiveRateThreshold(NodeNum sender) const
+{
+    concurrency::LockGuard guard(&cacheLock);
+    return effectiveRateThresholdLocked(sender);
+}
+
+uint32_t TrafficManagementModule::effectiveRateThresholdLocked(NodeNum sender) const
+{
+    const auto &cfg = moduleConfig.traffic_management;
+    uint32_t threshold = cfg.rate_limit_max_packets;
+    if (threshold == 0)
+        return 0;
+
+    const AntispamEntry *entry = findAntispamEntry(sender);
+    if (entry && isInFlaggedGroupLocked(entry->channel, entry->rssiClass)) {
+        const uint32_t groupBudget = groupBudgetLocked(entry->channel, entry->rssiClass);
+        if (groupBudget > 0 && groupBudget < threshold)
+            threshold = groupBudget;
+    }
+    if (cfg.budget_gossip_enabled == 0 || !entry)
+        return threshold;
+
+    uint8_t samples[3];
+    const uint8_t n = std::min<uint8_t>(3, entry->budgetSampleCount);
+    for (uint8_t i = 0; i < 3; i++)
+        samples[i] = (i < n) ? entry->budgetSamples[i] : 0;
+    for (uint8_t i = 0; i < 3; i++)
+        for (uint8_t j = i + 1; j < 3; j++)
+            if (samples[j] < samples[i])
+                std::swap(samples[i], samples[j]);
+    const uint32_t median = (n >= 2) ? samples[1] : 0;
+    if (median > threshold)
+        threshold = median;
+    return threshold;
+}
+
+void TrafficManagementModule::ingestNeighborTopSenders(NodeNum neighbor, const meshtastic_TopSender *entries, pb_size_t count)
+{
+    if (neighbor == 0 || !entries || count == 0)
+        return;
+    if (moduleConfig.traffic_management.budget_gossip_enabled == 0)
+        return;
+
+    concurrency::LockGuard guard(&cacheLock);
+    for (pb_size_t i = 0; i < count; i++) {
+        const meshtastic_TopSender &s = entries[i];
+        if (s.node == 0 || s.node == neighbor)
+            continue;
+        bool isNew = false;
+        AntispamEntry *entry = findOrCreateAntispamEntry(s.node, &isNew);
+        if (!entry)
+            continue;
+        bool recorded = false;
+        for (uint8_t k = 0; k < 3; k++) {
+            if (entry->budgetSampleMark[k] == neighbor) {
+                entry->budgetSamples[k] = static_cast<uint8_t>(std::min<uint32_t>(255, s.packets_this_window));
+                recorded = true;
+                break;
+            }
+        }
+        if (!recorded && entry->budgetSampleCount < 3) {
+            entry->budgetSamples[entry->budgetSampleCount] = static_cast<uint8_t>(std::min<uint32_t>(255, s.packets_this_window));
+            entry->budgetSampleMark[entry->budgetSampleCount] = neighbor;
+            entry->budgetSampleCount++;
+            recorded = true;
+        }
+        if (recorded) {
+            if (!entry->hasWindow) {
+                entry->hasWindow = 1;
+                entry->windowTick = currentRateTick();
+            }
+            TM_LOG_DEBUG("Antispam: budget sample for 0x%08x from 0x%08x: %u pkts (n=%u)", s.node, neighbor,
+                         (unsigned)s.packets_this_window, (unsigned)entry->budgetSampleCount);
+        }
+    }
+}
+
+int TrafficManagementModule::peekSenderBudgetForTest(NodeNum sender, uint32_t *medianOut)
+{
+    uint32_t median = 0;
+    {
+        concurrency::LockGuard guard(&cacheLock);
+        const AntispamEntry *entry = findAntispamEntry(sender);
+        if (!entry)
+            return -1;
+        uint8_t samples[3];
+        const uint8_t n = std::min<uint8_t>(3, entry->budgetSampleCount);
+        for (uint8_t i = 0; i < 3; i++)
+            samples[i] = (i < n) ? entry->budgetSamples[i] : 0;
+        for (uint8_t i = 0; i < 3; i++)
+            for (uint8_t j = i + 1; j < 3; j++)
+                if (samples[j] < samples[i])
+                    std::swap(samples[i], samples[j]);
+        if (n >= 2)
+            median = samples[1];
+    }
+    if (medianOut)
+        *medianOut = median;
+    return 0;
+}
+
+void TrafficManagementModule::snapshotTopSenders(meshtastic_TopSender (&out)[kTopSendersCount]) const
+{
+    for (int i = 0; i < kTopSendersCount; i++)
+        out[i] = meshtastic_TopSender_init_zero;
+
+#if TRAFFIC_MANAGEMENT_CACHE_SIZE == 0
+    return;
+#else
+    struct Cand {
+        NodeNum node;
+        uint8_t count;
+        uint8_t rssiClass;
+    };
+    Cand cands[3] = {{0, 0, 0xFF}, {0, 0, 0xFF}, {0, 0, 0xFF}};
+
+    concurrency::LockGuard guard(&cacheLock);
+    for (uint16_t i = 0; i < cacheSize(); i++) {
+        const UnifiedCacheEntry &e = cache[i];
+        if (e.node == 0)
+            continue;
+        const uint8_t cnt = e.getRateCount();
+        if (cnt == 0)
+            continue;
+        int slot = -1;
+        for (int k = 0; k < 3; k++) {
+            if (cands[k].count <= cnt) {
+                slot = k;
+                break;
+            }
+        }
+        if (slot < 0)
+            continue;
+        for (int k = 2; k > slot; k--)
+            cands[k] = cands[k - 1];
+        cands[slot].node = e.node;
+        cands[slot].count = cnt;
+        const AntispamEntry *a = findAntispamEntry(e.node);
+        cands[slot].rssiClass = a ? a->rssiClass : 0xFF;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        out[i].node = cands[i].node;
+        out[i].packets_this_window = cands[i].count;
+        out[i].rssi_class = cands[i].rssiClass;
+    }
+#endif
 }
 
 void TrafficManagementModule::stampNoRelayClaimLocked(NodeNum attester, NodeNum subject, uint32_t nowMs)
@@ -2673,6 +2824,103 @@ bool TrafficManagementModule::handleIdAttestation(const meshtastic_MeshPacket &m
     return true;
 }
 
+bool TrafficManagementModule::observeGroupCooccurrence(NodeNum node, uint8_t channel, uint8_t rssiClass)
+{
+    const uint32_t groupMin = moduleConfig.traffic_management.group_budget_enabled;
+    if (groupMin == 0)
+        return false;
+
+    concurrency::LockGuard guard(&cacheLock);
+    const uint8_t nowTick = currentRateTick();
+    GroupObsCell *cell = nullptr;
+    uint16_t cellIdx = 0;
+    for (uint16_t i = 0; i < kGroupObsEntries; i++) {
+        if (!groupObs[i].inUse || groupObs[i].windowTick != nowTick)
+            continue;
+        if (groupObs[i].channel == channel && groupObs[i].rssiClass == rssiClass) {
+            cell = &groupObs[i];
+            cellIdx = i;
+            break;
+        }
+    }
+    if (!cell) {
+        GroupObsCell *stale = nullptr;
+        uint16_t staleIdx = 0;
+        for (uint16_t i = 0; i < kGroupObsEntries; i++) {
+            if (!groupObs[i].inUse) {
+                cell = &groupObs[i];
+                cellIdx = i;
+                break;
+            }
+            if (!stale || ((static_cast<uint8_t>(nowTick - groupObs[i].windowTick) & 0x0F) >
+                           (static_cast<uint8_t>(nowTick - stale->windowTick) & 0x0F))) {
+                stale = &groupObs[i];
+                staleIdx = i;
+            }
+        }
+        if (!cell) {
+            cell = stale;
+            cellIdx = staleIdx;
+        }
+        if (!cell)
+            return false;
+        memset(cell, 0, sizeof(GroupObsCell));
+        cell->channel = channel;
+        cell->rssiClass = rssiClass;
+        cell->windowTick = nowTick;
+        cell->inUse = 1;
+        groupMedian[cellIdx] = 0;
+    }
+
+    cell->freshCount++;
+    const uint32_t localBudget = moduleConfig.traffic_management.rate_limit_max_packets;
+    if (cell->freshCount >= groupMin && localBudget > 0) {
+        const uint32_t perMember = std::max<uint32_t>(1, localBudget / cell->freshCount);
+        if (!cell->flagged) {
+            cell->flagged = true;
+            groupMedian[cellIdx] = perMember;
+            TM_LOG_INFO("Antispam: group budget triggered (ch=%u rssi=%u, %u fresh ids) -> %u pkts/member", channel,
+                        (unsigned)rssiClass, (unsigned)cell->freshCount, (unsigned)perMember);
+        }
+    }
+    (void)node;
+    return cell->flagged;
+}
+
+bool TrafficManagementModule::isInFlaggedGroup(NodeNum node, uint8_t channel, uint8_t rssiClass) const
+{
+    (void)node;
+    concurrency::LockGuard guard(&cacheLock);
+    return isInFlaggedGroupLocked(channel, rssiClass);
+}
+
+bool TrafficManagementModule::isInFlaggedGroupLocked(uint8_t channel, uint8_t rssiClass) const
+{
+    for (uint16_t i = 0; i < kGroupObsEntries; i++) {
+        if (groupObs[i].inUse && groupObs[i].windowTick == currentRateTick() && groupObs[i].channel == channel &&
+            groupObs[i].rssiClass == rssiClass && groupObs[i].flagged) {
+            return groupMedian[i] > 0;
+        }
+    }
+    return false;
+}
+
+uint32_t TrafficManagementModule::groupBudgetLocked(uint8_t channel, uint8_t rssiClass) const
+{
+    for (uint16_t i = 0; i < kGroupObsEntries; i++) {
+        if (groupObs[i].inUse && groupObs[i].windowTick == currentRateTick() && groupObs[i].channel == channel &&
+            groupObs[i].rssiClass == rssiClass)
+            return groupMedian[i];
+    }
+    return 0;
+}
+
+uint32_t TrafficManagementModule::groupBudgetForTest(uint8_t channel, uint8_t rssiClass)
+{
+    concurrency::LockGuard guard(&cacheLock);
+    return groupBudgetLocked(channel, rssiClass);
+}
+
 #if TRAFFIC_MANAGEMENT_CACHE_SIZE > 0
 void TrafficManagementModule::initAntispamCache()
 {
@@ -2736,6 +2984,11 @@ void TrafficManagementModule::maintainAntispamLocked()
             e.noRelayLocal = false;
             e.noRelayClaimer = 0;
             e.noRelayClaimMs = 0;
+            e.budgetSampleCount = 0;
+            for (uint8_t k = 0; k < 3; k++) {
+                e.budgetSamples[k] = 0;
+                e.budgetSampleMark[k] = 0;
+            }
         }
         if (e.promoted && e.promotedAtSecs != 0 && promoTtl > 0) {
             const uint32_t age = (nowSecs >= e.promotedAtSecs) ? (nowSecs - e.promotedAtSecs) : 0;
@@ -2751,6 +3004,12 @@ void TrafficManagementModule::maintainAntispamLocked()
                 e.trustLevel = 1;
                 TM_LOG_INFO("Antispam: 0x%08x lapsed from neighbor-attested back to TOFU-signed", e.node);
             }
+        }
+    }
+    for (uint16_t i = 0; i < kGroupObsEntries; i++) {
+        if (groupObs[i].inUse && (static_cast<uint8_t>(nowRateTick - groupObs[i].windowTick) & 0x0F) >= 1) {
+            memset(&groupObs[i], 0, sizeof(GroupObsCell));
+            groupMedian[i] = 0;
         }
     }
     for (uint16_t i = 0; i < kVouchObsEntries; i++) {
