@@ -1231,7 +1231,7 @@ ProcessMessage TrafficManagementModule::handleReceived(const meshtastic_MeshPack
         // Throttle nodes sending too many packets within a time window.
         // Excludes routing and admin packets which are essential for mesh operation.
 
-        if (cfg.rate_limit_window_secs > 0 && cfg.rate_limit_max_packets > 0) {
+        if (cfg.group_budget_enabled > 0 || (cfg.rate_limit_window_secs > 0 && cfg.rate_limit_max_packets > 0)) {
             if (mp.decoded.portnum != meshtastic_PortNum_ROUTING_APP && mp.decoded.portnum != meshtastic_PortNum_ADMIN_APP) {
                 if (isRateLimited(mp.from, nowMs)) {
                     logAction("drop", &mp, "rate-limit");
@@ -1760,9 +1760,17 @@ bool TrafficManagementModule::isRateLimited(NodeNum from, uint32_t nowMs)
     (void)nowMs;
     return false;
 #else
-    const uint32_t windowMs = secsToMs(moduleConfig.traffic_management.rate_limit_window_secs);
-    if (windowMs == 0 || moduleConfig.traffic_management.rate_limit_max_packets == 0)
+    const auto &cfg = moduleConfig.traffic_management;
+    if (cfg.rate_limit_max_packets == 0 && cfg.group_budget_enabled == 0)
         return false;
+
+    uint32_t windowSecs = cfg.rate_limit_window_secs;
+    if (windowSecs == 0) {
+        if (cfg.rate_limit_max_packets > 0)
+            return false;
+        windowSecs = default_traffic_mgmt_probation_window_secs;
+    }
+    const uint32_t windowMs = secsToMs(windowSecs);
 
     bool isNew = false;
     concurrency::LockGuard guard(&cacheLock);
@@ -1789,6 +1797,8 @@ bool TrafficManagementModule::isRateLimited(NodeNum from, uint32_t nowMs)
 
     // Threshold capped at 60 so a saturated reading (63) always exceeds it.
     uint32_t threshold = effectiveRateThresholdLocked(from);
+    if (threshold == 0)
+        return false;
     if (threshold > 60)
         threshold = 60;
 
@@ -2365,11 +2375,17 @@ uint32_t TrafficManagementModule::effectiveRateThresholdLocked(NodeNum sender) c
 {
     const auto &cfg = moduleConfig.traffic_management;
     uint32_t threshold = cfg.rate_limit_max_packets;
-    if (threshold == 0)
-        return 0;
-
     const AntispamEntry *entry = findAntispamEntry(sender);
-    if (entry && isInFlaggedGroupLocked(entry->channel, entry->rssiClass)) {
+    const bool flagged = entry && isInFlaggedGroupLocked(entry->channel, entry->rssiClass);
+
+    if (threshold == 0) {
+        if (!flagged)
+            return 0;
+        const uint32_t groupBudget = groupBudgetLocked(entry->channel, entry->rssiClass);
+        return groupBudget > 0 ? groupBudget : default_traffic_mgmt_group_budget_pool;
+    }
+
+    if (flagged) {
         const uint32_t groupBudget = groupBudgetLocked(entry->channel, entry->rssiClass);
         if (groupBudget > 0 && groupBudget < threshold)
             threshold = groupBudget;
@@ -2873,7 +2889,9 @@ bool TrafficManagementModule::observeGroupCooccurrence(NodeNum node, uint8_t cha
     }
 
     cell->freshCount++;
-    const uint32_t localBudget = moduleConfig.traffic_management.rate_limit_max_packets;
+    uint32_t localBudget = moduleConfig.traffic_management.rate_limit_max_packets;
+    if (localBudget == 0)
+        localBudget = default_traffic_mgmt_group_budget_pool;
     if (cell->freshCount >= groupMin && localBudget > 0) {
         const uint32_t perMember = std::max<uint32_t>(1, localBudget / cell->freshCount);
         if (!cell->flagged) {

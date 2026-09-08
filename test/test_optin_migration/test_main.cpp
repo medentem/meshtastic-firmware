@@ -194,7 +194,7 @@ void test_antispam_unconfiguredZeroesThenDefaults(void)
     TEST_ASSERT_EQUAL_UINT32(default_traffic_mgmt_no_relay_min_claimers, cfg.no_relay_min_claimers);
     TEST_ASSERT_EQUAL_UINT32(0, cfg.relay_budget_max_packets);
     TEST_ASSERT_EQUAL_UINT32(0, cfg.budget_gossip_enabled);
-    TEST_ASSERT_EQUAL_UINT32(0, cfg.group_budget_enabled);
+    TEST_ASSERT_EQUAL_UINT32(default_traffic_mgmt_group_budget_enabled, cfg.group_budget_enabled);
 }
 
 /// Already-configured antispam knobs are left alone.
