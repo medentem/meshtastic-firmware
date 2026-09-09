@@ -108,7 +108,7 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     /// senders stay capped; unsigned promotion does not lift the cap.
     uint8_t relayHopCap(const meshtastic_MeshPacket &mp) const;
 
-    /// 0 anonymous, 1 signed, 2 neighbor-attested; untracked is 0.
+    /// 0 anonymous, 1 signed, 2 neighbor-attested, 3 manual; untracked is 0.
     uint8_t trustLevelForTest(NodeNum node);
     /// Pin last-signed uptime for tests.
     void setLastSignedSecsForTest(NodeNum node, uint32_t secs);
@@ -359,7 +359,7 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
         uint32_t promotedAtSecs; // uptime when the promotion lease was armed; 0 = permanent
         uint8_t windowTick;      // 5-min nibble clock; valid when hasWindow
         uint8_t promoted : 1;
-        uint8_t trustLevel : 2; // 0 anonymous, 1 signed, 2 neighbor-attested
+        uint8_t trustLevel : 2; // 0 anonymous, 1 signed, 2 neighbor-attested, 3 manual
         uint8_t hasFirstSeen : 1;
         uint8_t hasLastSigned : 1;
         uint8_t hasWindow : 1;

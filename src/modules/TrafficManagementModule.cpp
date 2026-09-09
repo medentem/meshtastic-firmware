@@ -777,6 +777,14 @@ void TrafficManagementModule::onNodeKeyCommitted(NodeNum node, const uint8_t key
     if (proven)
         entry->keyManuallyVerified = true;
     // hasObserved/obsTick untouched: a key commit is knowledge, not an observation.
+    if (proven) {
+        bool asNew = false;
+        AntispamEntry *asEntry = findOrCreateAntispamEntry(node, &asNew);
+        if (asEntry && asEntry->trustLevel < 3) {
+            asEntry->trustLevel = 3;
+            TM_LOG_INFO("Antispam: 0x%08x raised to out-of-band-verified (manual key commit)", node);
+        }
+    }
 }
 
 bool TrafficManagementModule::copyPublicKey(NodeNum node, uint8_t out[32], bool *keyProven) const
@@ -2049,7 +2057,7 @@ bool TrafficManagementModule::noteFirstSeen(NodeNum node, uint8_t channel, uint8
     entry->channel = channel;
     if (rssiClass != 0xFF)
         entry->rssiClass = rssiClass;
-    if (signedObserved) {
+    if (signedObserved && entry->trustLevel < 3) {
         if (entry->trustLevel == 0)
             entry->trustLevel = 1;
         entry->hasLastSigned = 1;
@@ -2085,6 +2093,8 @@ uint8_t TrafficManagementModule::trustLevelForTest(NodeNum node)
     const AntispamEntry *entry = findAntispamEntry(node);
     if (!entry)
         return 0;
+    if (entry->trustLevel == 3)
+        return 3;
     if (entry->trustLevel == 2) {
         const uint32_t floor = l2FloorSecs();
         if (floor > 0 && entry->hasLastSigned) {
