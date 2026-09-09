@@ -3822,6 +3822,83 @@ static void test_tm_relayHopCap_probationOnly(void)
     TrafficManagementModule::s_testNowMs = baseNowMs;
 }
 
+/// Unsigned KNOWN_SINCE promotion ends greylist but does not lift the hop cap.
+static void test_tm_relayHopCap_unsignedVouchKeepsCap(void)
+{
+    const uint32_t baseNowMs = TrafficManagementModule::s_testNowMs;
+    TrafficManagementModule::s_testNowMs = baseNowMs + 300'000;
+
+    TrafficManagementModuleTestShim module;
+    moduleConfig.traffic_management.probation_window_secs = 300;
+    moduleConfig.traffic_management.probation_max_hop_limit = 2;
+    moduleConfig.traffic_management.attestation_min_tenure_secs = 0;
+    moduleConfig.traffic_management.attestation_min_observed_secs = 0;
+    moduleConfig.traffic_management.attestation_min_distinct_attesters = 2;
+    moduleConfig.traffic_management.vouch_max_per_subject_per_window = 1;
+    moduleConfig.traffic_management.vouch_max_subjects_per_window = 4;
+    moduleConfig.traffic_management.rate_limit_window_secs = 0;
+
+    trackSenderWithRssi(module, kTargetNode, -85);
+    trackSenderWithRssi(module, kRemoteNode, -95);
+    trackSenderWithRssi(module, kRemoteNode2, -95);
+
+    meshtastic_MeshPacket v1 = makeAttestationPacket(meshtastic_IdAttestation_Kind_KNOWN_SINCE, kTargetNode, kRemoteNode, 0);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(module.handleReceived(v1)));
+    meshtastic_MeshPacket v2 = makeAttestationPacket(meshtastic_IdAttestation_Kind_KNOWN_SINCE, kTargetNode, kRemoteNode2, 0);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(module.handleReceived(v2)));
+    TEST_ASSERT_TRUE(module.peekPromotedForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_INT(0, module.peekProbationStateForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_UINT8(0, module.trustLevelForTest(kTargetNode));
+
+    meshtastic_MeshPacket pkt = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kTargetNode);
+    pkt.hop_limit = 3;
+    TEST_ASSERT_EQUAL_UINT8(2, module.relayHopCap(pkt));
+
+    TrafficManagementModule::s_testNowMs += 300'000;
+    TEST_ASSERT_EQUAL_UINT8(3, module.relayHopCap(pkt));
+    TrafficManagementModule::s_testNowMs = baseNowMs;
+}
+
+/// Signed L2 neighbor attestation lifts the hop cap inside the probation window.
+static void test_tm_relayHopCap_signedL2LiftsInsideWindow(void)
+{
+    const uint32_t baseNowMs = TrafficManagementModule::s_testNowMs;
+    TrafficManagementModule::s_testNowMs = baseNowMs + 300'000;
+
+    TrafficManagementModuleTestShim module;
+    moduleConfig.traffic_management.probation_window_secs = 600;
+    moduleConfig.traffic_management.probation_max_hop_limit = 2;
+    moduleConfig.traffic_management.attestation_min_tenure_secs = 86'400;
+    moduleConfig.traffic_management.attestation_min_observed_secs = 300;
+    moduleConfig.traffic_management.attestation_min_distinct_attesters = 1;
+    moduleConfig.traffic_management.attestation_l2_min_tenure_secs = 300;
+    moduleConfig.traffic_management.rate_limit_window_secs = 0;
+
+    trackSender(module, kTargetNode);
+    trackSender(module, kRemoteNode);
+    TrafficManagementModule::s_testNowMs += 300'000;
+
+    meshtastic_MeshPacket signedSubj = makePositionPacket(kTargetNode, 374221234, -1220845678);
+    signedSubj.xeddsa_signed = true;
+    module.handleReceived(signedSubj);
+    meshtastic_MeshPacket signedAttester = makePositionPacket(kRemoteNode, 374221234, -1220845678);
+    signedAttester.xeddsa_signed = true;
+    module.handleReceived(signedAttester);
+
+    meshtastic_MeshPacket pkt = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kTargetNode);
+    pkt.hop_limit = 3;
+    TEST_ASSERT_EQUAL_UINT8(2, module.relayHopCap(pkt));
+
+    meshtastic_MeshPacket v =
+        makeAttestationPacket(meshtastic_IdAttestation_Kind_KNOWN_SINCE, kTargetNode, kRemoteNode, 1'000'000);
+    v.xeddsa_signed = true;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(module.handleReceived(v)));
+    TEST_ASSERT_EQUAL_UINT8(2, module.trustLevelForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_INT(0, module.peekProbationStateForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_UINT8(3, module.relayHopCap(pkt));
+    TrafficManagementModule::s_testNowMs = baseNowMs;
+}
+
 /// Tick 0 is a live window, not a sentinel for first-seen.
 static void test_tm_tickZero_firstSeen(void)
 {
@@ -4157,6 +4234,181 @@ static void test_tm_trustLadder_signedObservationStampsL1(void)
     TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kRemoteNode));
 }
 
+static void test_tm_trustLadder_l2FastPathDecayAndRenewal(void)
+{
+    const uint32_t baseNowMs = TrafficManagementModule::s_testNowMs;
+    TrafficManagementModule::s_testNowMs = baseNowMs + 300'000;
+
+    TrafficManagementModuleTestShim module;
+    moduleConfig.traffic_management.probation_window_secs = 600;
+    moduleConfig.traffic_management.attestation_min_tenure_secs = 86'400;
+    moduleConfig.traffic_management.attestation_min_observed_secs = 300;
+    moduleConfig.traffic_management.attestation_min_distinct_attesters = 1;
+    moduleConfig.traffic_management.attestation_l2_min_tenure_secs = 300;
+    moduleConfig.traffic_management.rate_limit_window_secs = 0;
+
+    trackSender(module, kTargetNode);
+    trackSender(module, kRemoteNode);
+    TEST_ASSERT_EQUAL_UINT8(0, module.trustLevelForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_UINT8(0, module.trustLevelForTest(kRemoteNode));
+
+    TrafficManagementModule::s_testNowMs += 300'000;
+
+    meshtastic_MeshPacket signedSubj = makePositionPacket(kTargetNode, 374221234, -1220845678);
+    signedSubj.xeddsa_signed = true;
+    module.handleReceived(signedSubj);
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kTargetNode));
+    meshtastic_MeshPacket signedAttester = makePositionPacket(kRemoteNode, 374221234, -1220845678);
+    signedAttester.xeddsa_signed = true;
+    module.handleReceived(signedAttester);
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kRemoteNode));
+    module.handleReceived(makePositionPacket(kRemoteNode2, 374221234, -1220845678));
+    TEST_ASSERT_EQUAL_UINT8(0, module.trustLevelForTest(kRemoteNode2));
+
+    meshtastic_MeshPacket v1 =
+        makeAttestationPacket(meshtastic_IdAttestation_Kind_KNOWN_SINCE, kTargetNode, kRemoteNode, 1'000'000);
+    v1.xeddsa_signed = true;
+    ProcessMessage r1 = module.handleReceived(v1);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(r1));
+    TEST_ASSERT_TRUE(module.peekPromotedForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_UINT8(2, module.trustLevelForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_INT(0, module.peekProbationStateForTest(kTargetNode));
+
+    TrafficManagementModule::s_testNowMs += 300'000;
+    meshtastic_MeshPacket signedSubj2 = makePositionPacket(kTargetNode, 374221234, -1220845678);
+    signedSubj2.id = 0x2001;
+    signedSubj2.xeddsa_signed = true;
+    module.handleReceived(signedSubj2);
+    TEST_ASSERT_EQUAL_UINT8(2, module.trustLevelForTest(kTargetNode));
+    (void)module.runOnce();
+    TEST_ASSERT_EQUAL_UINT8(2, module.trustLevelForTest(kTargetNode));
+
+    TrafficManagementModule::s_testNowMs += 300'000;
+    (void)module.runOnce();
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kTargetNode));
+    meshtastic_MeshPacket signedSubj3 = makePositionPacket(kTargetNode, 374221234, -1220845678);
+    signedSubj3.id = 0x2002;
+    signedSubj3.xeddsa_signed = true;
+    module.handleReceived(signedSubj3);
+    meshtastic_MeshPacket v2 =
+        makeAttestationPacket(meshtastic_IdAttestation_Kind_KNOWN_SINCE, kTargetNode, kRemoteNode, 1'000'000);
+    v2.xeddsa_signed = true;
+    ProcessMessage r2 = module.handleReceived(v2);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(r2));
+    TEST_ASSERT_TRUE(module.peekPromotedForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_UINT8(2, module.trustLevelForTest(kTargetNode));
+
+    moduleConfig.traffic_management.attestation_l2_min_tenure_secs = 0;
+    moduleConfig.traffic_management.attestation_min_observed_secs = 0;
+    trackSender(module, kRemoteNode4);
+    TrafficManagementModule::s_testNowMs += 300'000;
+    meshtastic_MeshPacket signedSubj4 = makePositionPacket(kRemoteNode4, 374221234, -1220845678);
+    signedSubj4.id = 0x2003;
+    signedSubj4.xeddsa_signed = true;
+    module.handleReceived(signedSubj4);
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kRemoteNode4));
+    meshtastic_MeshPacket v3 =
+        makeAttestationPacket(meshtastic_IdAttestation_Kind_KNOWN_SINCE, kRemoteNode4, kRemoteNode, 1'000'000);
+    ProcessMessage r3 = module.handleReceived(v3);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(r3));
+    TEST_ASSERT_TRUE(module.peekPromotedForTest(kRemoteNode4));
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kRemoteNode4));
+    TrafficManagementModule::s_testNowMs = baseNowMs;
+}
+
+static void test_tm_trustLadder_l2SignatureRequiredMixedMeshFallback(void)
+{
+    const uint32_t baseNowMs = TrafficManagementModule::s_testNowMs;
+    TrafficManagementModule::s_testNowMs = baseNowMs + 300'000;
+
+    TrafficManagementModuleTestShim module;
+    moduleConfig.traffic_management.probation_window_secs = 600;
+    moduleConfig.traffic_management.attestation_min_tenure_secs = 86'400;
+    moduleConfig.traffic_management.attestation_min_observed_secs = 300;
+    moduleConfig.traffic_management.attestation_min_distinct_attesters = 1;
+    moduleConfig.traffic_management.attestation_l2_min_tenure_secs = 300;
+    moduleConfig.traffic_management.rate_limit_window_secs = 0;
+
+    trackSender(module, kTargetNode);
+    trackSender(module, kRemoteNode);
+    TrafficManagementModule::s_testNowMs += 300'000;
+    meshtastic_MeshPacket signedSubj = makePositionPacket(kTargetNode, 374221234, -1220845678);
+    signedSubj.xeddsa_signed = true;
+    module.handleReceived(signedSubj);
+    meshtastic_MeshPacket signedAttester = makePositionPacket(kRemoteNode, 374221234, -1220845678);
+    signedAttester.xeddsa_signed = true;
+    module.handleReceived(signedAttester);
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kRemoteNode));
+
+    meshtastic_MeshPacket v1 =
+        makeAttestationPacket(meshtastic_IdAttestation_Kind_KNOWN_SINCE, kTargetNode, kRemoteNode, 1'000'000);
+    ProcessMessage r1 = module.handleReceived(v1);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(r1));
+    TEST_ASSERT_TRUE(module.peekPromotedForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kTargetNode));
+
+    meshtastic_MeshPacket v2 =
+        makeAttestationPacket(meshtastic_IdAttestation_Kind_KNOWN_SINCE, kTargetNode, kRemoteNode, 1'000'000);
+    v2.xeddsa_signed = true;
+    ProcessMessage r2 = module.handleReceived(v2);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(r2));
+    TEST_ASSERT_TRUE(module.peekPromotedForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_UINT8(2, module.trustLevelForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_INT(0, module.peekProbationStateForTest(kTargetNode));
+    TrafficManagementModule::s_testNowMs = baseNowMs;
+}
+
+static void test_tm_trustLadder_tenureCappedL2Upgrade(void)
+{
+    const uint32_t baseNowMs = TrafficManagementModule::s_testNowMs;
+    TrafficManagementModule::s_testNowMs = baseNowMs + 300'000;
+
+    TrafficManagementModuleTestShim module;
+    moduleConfig.traffic_management.probation_window_secs = 600;
+    moduleConfig.traffic_management.attestation_min_tenure_secs = 0;
+    moduleConfig.traffic_management.attestation_min_observed_secs = 0;
+    moduleConfig.traffic_management.attestation_min_distinct_attesters = 1;
+    moduleConfig.traffic_management.attestation_l2_min_tenure_secs = 30UL * 86'400UL;
+
+    trackSender(module, kRemoteNode);
+    TrafficManagementModule::s_testNowMs += 30UL * 86'400UL * 1000UL;
+    trackSender(module, kTargetNode);
+    meshtastic_MeshPacket signedAttester = makePositionPacket(kRemoteNode, 374221234, -1220845678);
+    signedAttester.xeddsa_signed = true;
+    module.handleReceived(signedAttester);
+    meshtastic_MeshPacket signedSubj = makePositionPacket(kTargetNode, 374221234, -1220845678);
+    signedSubj.xeddsa_signed = true;
+    module.handleReceived(signedSubj);
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kRemoteNode));
+
+    meshtastic_MeshPacket v1 = makeAttestationPacket(meshtastic_IdAttestation_Kind_KNOWN_SINCE, kTargetNode, kRemoteNode, 0);
+    v1.xeddsa_signed = true;
+    ProcessMessage r1 = module.handleReceived(v1);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(r1));
+    TEST_ASSERT_TRUE(module.peekPromotedForTest(kTargetNode));
+    TEST_ASSERT_EQUAL_UINT8(2, module.trustLevelForTest(kTargetNode));
+
+    trackSender(module, kRemoteNode2);
+    trackSender(module, kRemoteNode4);
+    meshtastic_MeshPacket signedAttester2 = makePositionPacket(kRemoteNode2, 374221234, -1220845678);
+    signedAttester2.id = 0x3001;
+    signedAttester2.xeddsa_signed = true;
+    module.handleReceived(signedAttester2);
+    meshtastic_MeshPacket signedSubj2 = makePositionPacket(kRemoteNode4, 374221234, -1220845678);
+    signedSubj2.id = 0x3002;
+    signedSubj2.xeddsa_signed = true;
+    module.handleReceived(signedSubj2);
+    meshtastic_MeshPacket v2 = makeAttestationPacket(meshtastic_IdAttestation_Kind_KNOWN_SINCE, kRemoteNode4, kRemoteNode2, 0);
+    v2.xeddsa_signed = true;
+    ProcessMessage r2 = module.handleReceived(v2);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(r2));
+    TEST_ASSERT_TRUE(module.peekPromotedForTest(kRemoteNode4));
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kRemoteNode4));
+    TrafficManagementModule::s_testNowMs = baseNowMs;
+}
+
 } // namespace
 
 void setUp(void)
@@ -4297,6 +4549,8 @@ TM_TEST_ENTRY void setup()
     RUN_TEST(test_tm_promotionQuorum_perReporterCapsApply);
     RUN_TEST(test_tm_oldConfig_loadsClean);
     RUN_TEST(test_tm_relayHopCap_probationOnly);
+    RUN_TEST(test_tm_relayHopCap_unsignedVouchKeepsCap);
+    RUN_TEST(test_tm_relayHopCap_signedL2LiftsInsideWindow);
     RUN_TEST(test_tm_relayHopCap_untrackedIsProbation);
     RUN_TEST(test_tm_relayHopCap_noTableDoesNotCap);
     RUN_TEST(test_tm_tickZero_firstSeen);
@@ -4310,6 +4564,9 @@ TM_TEST_ENTRY void setup()
     RUN_TEST(test_tm_knownSince_hopLimitIsOne);
     RUN_TEST(test_tm_antispamMigration_zeroKnobsGetDefaults);
     RUN_TEST(test_tm_trustLadder_signedObservationStampsL1);
+    RUN_TEST(test_tm_trustLadder_l2FastPathDecayAndRenewal);
+    RUN_TEST(test_tm_trustLadder_l2SignatureRequiredMixedMeshFallback);
+    RUN_TEST(test_tm_trustLadder_tenureCappedL2Upgrade);
     exit(UNITY_END());
 }
 

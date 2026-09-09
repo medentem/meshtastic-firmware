@@ -1989,10 +1989,24 @@ bool TrafficManagementModule::attesterObservedEnoughLocked(const AntispamEntry *
 
 bool TrafficManagementModule::inProbationLocked(const AntispamEntry *entry) const
 {
-    if (!entry || !entry->hasFirstSeen || entry->promoted)
+    if (!entry || !entry->hasFirstSeen || entry->promoted || entry->trustLevel >= 2)
         return false;
     const uint32_t windowSecs = moduleConfig.traffic_management.probation_window_secs;
     if (windowSecs == 0)
+        return false;
+    return observedAgeSecsLocked(entry) < windowSecs;
+}
+
+bool TrafficManagementModule::hopCapAppliesLocked(const AntispamEntry *entry) const
+{
+    if (!antispam)
+        return false;
+    const uint32_t windowSecs = moduleConfig.traffic_management.probation_window_secs;
+    if (windowSecs == 0)
+        return false;
+    if (!entry || !entry->hasFirstSeen)
+        return true;
+    if (entry->trustLevel >= 2)
         return false;
     return observedAgeSecsLocked(entry) < windowSecs;
 }
@@ -2069,7 +2083,33 @@ uint8_t TrafficManagementModule::trustLevelForTest(NodeNum node)
 {
     concurrency::LockGuard guard(&cacheLock);
     const AntispamEntry *entry = findAntispamEntry(node);
-    return entry ? entry->trustLevel : 0;
+    if (!entry)
+        return 0;
+    if (entry->trustLevel == 2) {
+        const uint32_t floor = l2FloorSecs();
+        if (floor > 0 && entry->hasLastSigned) {
+            const uint32_t now = uptimeSecs();
+            const uint32_t age = now >= entry->lastSignedSecs ? now - entry->lastSignedSecs : 0;
+            if (age >= floor)
+                return 1;
+        } else if (floor > 0 && !entry->hasLastSigned) {
+            return 1;
+        }
+        return 2;
+    }
+    return entry->trustLevel;
+}
+
+void TrafficManagementModule::setLastSignedSecsForTest(NodeNum node, uint32_t secs)
+{
+    concurrency::LockGuard guard(&cacheLock);
+    AntispamEntry *entry = findAntispamEntry(node);
+    if (!entry)
+        return;
+    entry->hasLastSigned = 1;
+    entry->lastSignedSecs = secs;
+    if (entry->trustLevel < 1)
+        entry->trustLevel = 1;
 }
 
 int TrafficManagementModule::peekProbationStateForTest(NodeNum node)
@@ -2080,7 +2120,7 @@ int TrafficManagementModule::peekProbationStateForTest(NodeNum node)
         return -1;
     if (moduleConfig.traffic_management.probation_window_secs == 0)
         return 0;
-    if (entry->promoted)
+    if (entry->promoted || entry->trustLevel >= 2)
         return 0;
     return inProbationLocked(entry) ? 1 : 0;
 }
@@ -2211,6 +2251,27 @@ uint32_t TrafficManagementModule::attestationMinDistinctAttestersLocked() const
     return moduleConfig.traffic_management.attestation_min_distinct_attesters;
 }
 
+uint32_t TrafficManagementModule::l2FloorSecs() const
+{
+    uint32_t secs = moduleConfig.traffic_management.attestation_l2_min_tenure_secs;
+    if (secs == 0)
+        secs = moduleConfig.traffic_management.attestation_min_observed_secs;
+    return secs;
+}
+
+bool TrafficManagementModule::l2VouchEligibleLocked(const AntispamEntry *subject, NodeNum attester, bool signedObserved) const
+{
+    if (!signedObserved)
+        return false;
+    const uint32_t l2Floor = l2FloorSecs();
+    if (l2Floor == 0 || !subject || subject->trustLevel < 1)
+        return false;
+    const AntispamEntry *attesterEntry = findAntispamEntry(attester);
+    if (!attesterEntry || attesterEntry->trustLevel < 1)
+        return false;
+    return attesterObservedEnoughLocked(attesterEntry, l2Floor);
+}
+
 uint8_t TrafficManagementModule::peekAttestQuorumForTest(NodeNum subject)
 {
     concurrency::LockGuard guard(&cacheLock);
@@ -2257,7 +2318,7 @@ uint8_t TrafficManagementModule::relayHopCap(const meshtastic_MeshPacket &mp) co
         // No table means untrackable, not untracked: do not hop-cap every sender.
         if (antispam && cfg.probation_window_secs > 0 && probationCap > 0 && probationCap < cap) {
             const AntispamEntry *entry = findAntispamEntry(from);
-            const bool senderInProbation = !entry || !entry->hasFirstSeen || inProbationLocked(entry);
+            const bool senderInProbation = hopCapAppliesLocked(entry);
             if (senderInProbation) {
                 cap = probationCap;
                 changed = true;
@@ -2347,6 +2408,10 @@ bool TrafficManagementModule::handleIdAttestation(const meshtastic_MeshPacket &m
     if (entry->promoted) {
         if (entry->promotedAtSecs != 0)
             entry->promotedAtSecs = uptimeSecs();
+        if (entry->trustLevel == 1 && l2VouchEligibleLocked(entry, attester, mp.xeddsa_signed)) {
+            entry->trustLevel = 2;
+            TM_LOG_INFO("Antispam: 0x%08x re-raised to neighbor-attested by verified signer 0x%08x", att.subject, attester);
+        }
         return true;
     }
     if (!entry->hasFirstSeen)
@@ -2361,6 +2426,10 @@ bool TrafficManagementModule::handleIdAttestation(const meshtastic_MeshPacket &m
         }
     }
     entry->promoted = true;
+    if (entry->trustLevel == 1 && l2VouchEligibleLocked(entry, attester, mp.xeddsa_signed)) {
+        entry->trustLevel = 2;
+        TM_LOG_INFO("Antispam: 0x%08x raised to neighbor-attested by verified signer 0x%08x", att.subject, attester);
+    }
     entry->promotedAtSecs = (cfg.attestation_promotion_ttl_secs > 0) ? uptimeSecs() : 0;
     incrementStatLocked(&stats.attestation_promotions);
     TM_LOG_INFO("Antispam: promoted 0x%08x via KNOWN_SINCE from 0x%08x (quorum %u)", att.subject, attester,
@@ -2416,6 +2485,7 @@ void TrafficManagementModule::maintainAntispamLocked()
     const uint8_t nowRateTick = currentRateTick();
     const uint32_t nowSecs = uptimeSecs();
     const uint32_t promoTtl = moduleConfig.traffic_management.attestation_promotion_ttl_secs;
+    const uint32_t l2Floor = l2FloorSecs();
     for (uint16_t i = 0; i < antispamCacheSize(); i++) {
         AntispamEntry &e = antispam[i];
         if (e.node == 0)
@@ -2432,6 +2502,13 @@ void TrafficManagementModule::maintainAntispamLocked()
                 e.promoted = false;
                 e.promotedAtSecs = 0;
                 TM_LOG_INFO("Antispam: promotion for 0x%08x lapsed without renewal", e.node);
+            }
+        }
+        if (e.trustLevel == 2 && l2Floor > 0) {
+            const bool quiet = !e.hasLastSigned || ((nowSecs >= e.lastSignedSecs) ? (nowSecs - e.lastSignedSecs) : 0) >= l2Floor;
+            if (quiet) {
+                e.trustLevel = 1;
+                TM_LOG_INFO("Antispam: 0x%08x lapsed from neighbor-attested back to TOFU-signed", e.node);
             }
         }
     }
