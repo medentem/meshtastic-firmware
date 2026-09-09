@@ -57,7 +57,8 @@ enum class TrafficType { POSITION, TELEMETRY };
 #define default_traffic_mgmt_attestation_min_tenure_secs (24 * 60 * 60)
 #define default_traffic_mgmt_probation_max_hop_limit 2
 #define default_traffic_mgmt_budget_gossip_enabled 0
-#define default_traffic_mgmt_group_budget_enabled 0
+#define default_traffic_mgmt_group_budget_enabled 5
+#define default_traffic_mgmt_group_budget_pool 12
 #define default_traffic_mgmt_relay_budget_max_packets 0
 #define default_traffic_mgmt_congestion_hop_cap_pct 0
 #define default_traffic_mgmt_no_relay_requires_local_exhaustion 1

@@ -1314,6 +1314,7 @@ void installAntispamDefaults(meshtastic_ModuleConfig_TrafficManagementConfig &cf
     cfg.attestation_min_distinct_attesters = default_traffic_mgmt_attestation_min_distinct_attesters;
     cfg.attestation_promotion_ttl_secs = default_traffic_mgmt_attestation_promotion_ttl_secs;
     cfg.attestation_l2_min_tenure_secs = default_traffic_mgmt_attestation_l2_min_tenure_secs;
+    cfg.group_budget_enabled = default_traffic_mgmt_group_budget_enabled;
 }
 
 // --- 2.8 position/telemetry opt-in migration helpers -------------------------------------------------

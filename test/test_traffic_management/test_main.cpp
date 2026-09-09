@@ -4198,6 +4198,7 @@ static void test_tm_antispamMigration_zeroKnobsGetDefaults(void)
     TEST_ASSERT_EQUAL_UINT32(default_traffic_mgmt_probation_window_secs, cfg.probation_window_secs);
     TEST_ASSERT_EQUAL_UINT32(default_traffic_mgmt_no_relay_min_claimers, cfg.no_relay_min_claimers);
     TEST_ASSERT_EQUAL_UINT32(0, cfg.relay_budget_max_packets);
+    TEST_ASSERT_EQUAL_UINT32(default_traffic_mgmt_group_budget_enabled, cfg.group_budget_enabled);
 
     cfg.probation_window_secs = 99;
     TEST_ASSERT_FALSE(antispamKnobsUnconfigured(cfg));
@@ -4641,6 +4642,162 @@ static void test_tm_relayHopCap_probationL2AndCongestion(void)
     TrafficManagementModule::s_testNowMs = baseNowMs;
 }
 
+static void test_tm_budgetGossip_disabledIsNoOp(void)
+{
+    TrafficManagementModuleTestShim module;
+    moduleConfig.traffic_management.budget_gossip_enabled = 0;
+    meshtastic_TopSender sample = meshtastic_TopSender_init_zero;
+    sample.node = kTargetNode;
+    sample.packets_this_window = 40;
+    module.ingestNeighborTopSenders(kRemoteNode, &sample, 1);
+    TEST_ASSERT_EQUAL_INT(-1, module.peekSenderBudgetForTest(kTargetNode, nullptr));
+}
+
+static void test_tm_budgetGossip_medianRaisesOnly(void)
+{
+    const uint32_t baseNowMs = TrafficManagementModule::s_testNowMs;
+    TrafficManagementModule::s_testNowMs = baseNowMs + 300'000;
+
+    TrafficManagementModuleTestShim module;
+    moduleConfig.traffic_management.rate_limit_window_secs = 300;
+    moduleConfig.traffic_management.rate_limit_max_packets = 10;
+    moduleConfig.traffic_management.budget_gossip_enabled = 1;
+    moduleConfig.traffic_management.probation_window_secs = 0;
+
+    meshtastic_TopSender sample = meshtastic_TopSender_init_zero;
+    sample.node = kTargetNode;
+    sample.packets_this_window = 20;
+    module.ingestNeighborTopSenders(kRemoteNode, &sample, 1);
+    sample.packets_this_window = 25;
+    module.ingestNeighborTopSenders(kRemoteNode2, &sample, 1);
+    sample.packets_this_window = 30;
+    module.ingestNeighborTopSenders(kRemoteNode3, &sample, 1);
+
+    uint32_t median = 0;
+    TEST_ASSERT_EQUAL_INT(0, module.peekSenderBudgetForTest(kTargetNode, &median));
+    TEST_ASSERT_EQUAL_UINT32(25, median);
+
+    for (int i = 0; i < 12; i++) {
+        meshtastic_MeshPacket txt = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kTargetNode);
+        txt.id = 0x4100 + i;
+        ProcessMessage r = module.handleReceived(txt);
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE), static_cast<int>(r));
+    }
+
+    TrafficManagementModule::s_testNowMs += 300'000;
+    (void)module.runOnce();
+    median = 99;
+    TEST_ASSERT_EQUAL_INT(0, module.peekSenderBudgetForTest(kTargetNode, &median));
+    TEST_ASSERT_EQUAL_UINT32(0, median);
+    TrafficManagementModule::s_testNowMs = baseNowMs;
+}
+
+static void test_tm_groupBudget_flagsChannelRssiClass(void)
+{
+    const uint32_t baseNowMs = TrafficManagementModule::s_testNowMs;
+    TrafficManagementModule::s_testNowMs = baseNowMs + 300'000;
+
+    TrafficManagementModuleTestShim module;
+    moduleConfig.traffic_management.rate_limit_window_secs = 300;
+    moduleConfig.traffic_management.rate_limit_max_packets = 10;
+    moduleConfig.traffic_management.group_budget_enabled = 2;
+    moduleConfig.traffic_management.probation_window_secs = 0;
+    moduleConfig.traffic_management.budget_gossip_enabled = 0;
+
+    trackSenderWithRssi(module, kRemoteNode, -95);
+    TEST_ASSERT_EQUAL_UINT32(0, module.groupBudgetForTest(0, 2));
+    trackSenderWithRssi(module, kRemoteNode2, -95);
+    TEST_ASSERT_EQUAL_UINT32(5, module.groupBudgetForTest(0, 2));
+
+    for (int i = 0; i < 5; i++) {
+        meshtastic_MeshPacket txt = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kRemoteNode);
+        txt.id = 0x4200 + i;
+        ProcessMessage r = module.handleReceived(txt);
+        if (i < 4) {
+            TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE), static_cast<int>(r));
+        } else {
+            TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(r));
+        }
+    }
+    TEST_ASSERT_EQUAL_UINT32(1, module.getStats().rate_limit_drops);
+    TrafficManagementModule::s_testNowMs = baseNowMs;
+}
+
+/// Group budget is self-contained: rate_limit_max_packets=0 still splits the pool.
+static void test_tm_groupBudget_poolFiresWhenRateLimitZero(void)
+{
+    const uint32_t baseNowMs = TrafficManagementModule::s_testNowMs;
+    TrafficManagementModule::s_testNowMs = baseNowMs + 300'000;
+
+    TrafficManagementModuleTestShim module;
+    moduleConfig.traffic_management.rate_limit_max_packets = 0;
+    moduleConfig.traffic_management.rate_limit_window_secs = 0;
+    moduleConfig.traffic_management.group_budget_enabled = default_traffic_mgmt_group_budget_enabled;
+    moduleConfig.traffic_management.probation_window_secs = 0;
+    moduleConfig.traffic_management.budget_gossip_enabled = 0;
+
+    constexpr NodeNum kSwarm[] = {kRemoteNode, kTargetNode, kRemoteNode2, kRemoteNode3, kRemoteNode4};
+    for (NodeNum n : kSwarm)
+        trackSenderWithRssi(module, n, -95);
+    TEST_ASSERT_EQUAL_UINT32(default_traffic_mgmt_group_budget_pool / 5, module.groupBudgetForTest(0, 2));
+
+    constexpr uint32_t kPerMember = default_traffic_mgmt_group_budget_pool / 5;
+    ProcessMessage last = ProcessMessage::CONTINUE;
+    for (uint32_t i = 0; i < kPerMember; i++) {
+        meshtastic_MeshPacket txt = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kRemoteNode);
+        txt.id = 0x4600 + i;
+        last = module.handleReceived(txt);
+    }
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP), static_cast<int>(last));
+    TEST_ASSERT_EQUAL_UINT32(1, module.getStats().rate_limit_drops);
+
+    constexpr NodeNum kLone = 0x77777777;
+    (void)module.handleReceived(makePositionPacketWithRssi(kLone, -85));
+    for (int i = 0; i < 8; i++) {
+        meshtastic_MeshPacket txt = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLone);
+        txt.id = 0x4700 + i;
+        txt.has_rx_rssi = true;
+        txt.rx_rssi = -85;
+        ProcessMessage r = module.handleReceived(txt);
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE), static_cast<int>(r));
+    }
+    TEST_ASSERT_EQUAL_UINT32(0, module.groupBudgetForTest(0, 3));
+    TEST_ASSERT_EQUAL_UINT32(1, module.getStats().rate_limit_drops);
+    TrafficManagementModule::s_testNowMs = baseNowMs;
+}
+
+static void test_tm_snapshotTopSenders_ordersByRateCount(void)
+{
+    const uint32_t baseNowMs = TrafficManagementModule::s_testNowMs;
+    TrafficManagementModule::s_testNowMs = baseNowMs + 300'000;
+
+    TrafficManagementModuleTestShim module;
+    moduleConfig.traffic_management.rate_limit_window_secs = 300;
+    moduleConfig.traffic_management.rate_limit_max_packets = 60;
+    moduleConfig.traffic_management.budget_gossip_enabled = 1;
+
+    auto flood = [&](NodeNum from, int n, uint16_t idBase) {
+        for (int i = 0; i < n; i++) {
+            meshtastic_MeshPacket txt = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, from);
+            txt.id = idBase + i;
+            (void)module.handleReceived(txt);
+        }
+    };
+    flood(kRemoteNode, 8, 0x4300);
+    flood(kRemoteNode2, 3, 0x4400);
+    flood(kRemoteNode3, 5, 0x4500);
+
+    meshtastic_TopSender top[TrafficManagementModule::kTopSendersCount];
+    module.snapshotTopSenders(top);
+    TEST_ASSERT_EQUAL_HEX32(kRemoteNode, top[0].node);
+    TEST_ASSERT_EQUAL_UINT32(8, top[0].packets_this_window);
+    TEST_ASSERT_EQUAL_HEX32(kRemoteNode3, top[1].node);
+    TEST_ASSERT_EQUAL_UINT32(5, top[1].packets_this_window);
+    TEST_ASSERT_EQUAL_HEX32(kRemoteNode2, top[2].node);
+    TEST_ASSERT_EQUAL_UINT32(3, top[2].packets_this_window);
+    TrafficManagementModule::s_testNowMs = baseNowMs;
+}
+
 } // namespace
 
 void setUp(void)
@@ -4804,6 +4961,11 @@ TM_TEST_ENTRY void setup()
     RUN_TEST(test_tm_noRelay_rejectedBelowTenureFloor);
     RUN_TEST(test_tm_noRelay_perReporterCapAndTTLClearOnRollover);
     RUN_TEST(test_tm_relayHopCap_probationL2AndCongestion);
+    RUN_TEST(test_tm_budgetGossip_disabledIsNoOp);
+    RUN_TEST(test_tm_budgetGossip_medianRaisesOnly);
+    RUN_TEST(test_tm_groupBudget_flagsChannelRssiClass);
+    RUN_TEST(test_tm_groupBudget_poolFiresWhenRateLimitZero);
+    RUN_TEST(test_tm_snapshotTopSenders_ordersByRateCount);
     exit(UNITY_END());
 }
 
