@@ -294,7 +294,7 @@ bool meshtastic_NodeDatabase_callback(pb_istream_t *istream, pb_ostream_t *ostre
     case meshtastic_NodeDatabase_positions_tag: {
         if (ostream) {
             const auto *vec = static_cast<const std::vector<meshtastic_NodePositionEntry> *>(iter->pData);
-            for (auto item : *vec) {
+            for (const auto &item : *vec) {
                 if (!pb_encode_tag_for_field(ostream, iter))
                     return false;
                 if (!pb_encode_submessage(ostream, meshtastic_NodePositionEntry_fields, &item))
@@ -320,7 +320,7 @@ bool meshtastic_NodeDatabase_callback(pb_istream_t *istream, pb_ostream_t *ostre
     case meshtastic_NodeDatabase_telemetry_tag: {
         if (ostream) {
             const auto *vec = static_cast<const std::vector<meshtastic_NodeTelemetryEntry> *>(iter->pData);
-            for (auto item : *vec) {
+            for (const auto &item : *vec) {
                 if (!pb_encode_tag_for_field(ostream, iter))
                     return false;
                 if (!pb_encode_submessage(ostream, meshtastic_NodeTelemetryEntry_fields, &item))
@@ -346,7 +346,7 @@ bool meshtastic_NodeDatabase_callback(pb_istream_t *istream, pb_ostream_t *ostre
     case meshtastic_NodeDatabase_status_tag: {
         if (ostream) {
             const auto *vec = static_cast<const std::vector<meshtastic_NodeStatusEntry> *>(iter->pData);
-            for (auto item : *vec) {
+            for (const auto &item : *vec) {
                 if (!pb_encode_tag_for_field(ostream, iter))
                     return false;
                 if (!pb_encode_submessage(ostream, meshtastic_NodeStatusEntry_fields, &item))
@@ -372,7 +372,7 @@ bool meshtastic_NodeDatabase_callback(pb_istream_t *istream, pb_ostream_t *ostre
     case meshtastic_NodeDatabase_environment_tag: {
         if (ostream) {
             const auto *vec = static_cast<const std::vector<meshtastic_NodeEnvironmentEntry> *>(iter->pData);
-            for (auto item : *vec) {
+            for (const auto &item : *vec) {
                 if (!pb_encode_tag_for_field(ostream, iter))
                     return false;
                 if (!pb_encode_submessage(ostream, meshtastic_NodeEnvironmentEntry_fields, &item))
@@ -1282,7 +1282,38 @@ static void installTrafficManagementDefaults(meshtastic_LocalModuleConfig &mc)
     // STM32WL is excluded at compile time (HAS_TRAFFIC_MANAGEMENT=0 in mesh-pb-constants.h).
     // Set position_min_interval_secs=0 at runtime to disable dedup.
     mc.traffic_management.position_min_interval_secs = default_traffic_mgmt_position_min_interval_secs;
+    installAntispamDefaults(mc.traffic_management);
 #endif
+}
+
+/// True when every antispam knob is still protobuf-zero.
+bool antispamKnobsUnconfigured(const meshtastic_ModuleConfig_TrafficManagementConfig &cfg)
+{
+    return cfg.probation_window_secs == 0 && cfg.attestation_min_tenure_secs == 0 && cfg.probation_max_hop_limit == 0 &&
+           cfg.budget_gossip_enabled == 0 && cfg.group_budget_enabled == 0 && cfg.relay_budget_max_packets == 0 &&
+           cfg.congestion_hop_cap_pct == 0 && cfg.no_relay_requires_local_exhaustion == 0 &&
+           cfg.no_relay_max_subjects_per_window == 0 && cfg.no_relay_ttl_secs == 0 && cfg.attestation_min_observed_secs == 0 &&
+           cfg.vouch_max_per_subject_per_window == 0 && cfg.vouch_max_subjects_per_window == 0 &&
+           cfg.attestation_min_distinct_attesters == 0 && cfg.attestation_promotion_ttl_secs == 0 &&
+           cfg.attestation_l2_min_tenure_secs == 0 && cfg.no_relay_min_claimers == 0;
+}
+
+/// Write shipped antispam defaults without touching position/rate-limit fields.
+void installAntispamDefaults(meshtastic_ModuleConfig_TrafficManagementConfig &cfg)
+{
+    cfg.probation_window_secs = default_traffic_mgmt_probation_window_secs;
+    cfg.attestation_min_tenure_secs = default_traffic_mgmt_attestation_min_tenure_secs;
+    cfg.probation_max_hop_limit = default_traffic_mgmt_probation_max_hop_limit;
+    cfg.no_relay_requires_local_exhaustion = default_traffic_mgmt_no_relay_requires_local_exhaustion;
+    cfg.no_relay_max_subjects_per_window = default_traffic_mgmt_no_relay_max_subjects_per_window;
+    cfg.no_relay_ttl_secs = default_traffic_mgmt_no_relay_ttl_secs;
+    cfg.no_relay_min_claimers = default_traffic_mgmt_no_relay_min_claimers;
+    cfg.attestation_min_observed_secs = default_traffic_mgmt_attestation_min_observed_secs;
+    cfg.vouch_max_per_subject_per_window = default_traffic_mgmt_vouch_max_per_subject_per_window;
+    cfg.vouch_max_subjects_per_window = default_traffic_mgmt_vouch_max_subjects_per_window;
+    cfg.attestation_min_distinct_attesters = default_traffic_mgmt_attestation_min_distinct_attesters;
+    cfg.attestation_promotion_ttl_secs = default_traffic_mgmt_attestation_promotion_ttl_secs;
+    cfg.attestation_l2_min_tenure_secs = default_traffic_mgmt_attestation_l2_min_tenure_secs;
 }
 
 // --- 2.8 position/telemetry opt-in migration helpers -------------------------------------------------
@@ -2724,6 +2755,10 @@ void NodeDB::loadFromDisk()
     if (!moduleConfig.has_traffic_management) {
         LOG_INFO("Traffic management never configured, installing always-on defaults");
         installTrafficManagementDefaults(moduleConfig);
+        saveToDisk(SEGMENT_MODULECONFIG);
+    } else if (antispamKnobsUnconfigured(moduleConfig.traffic_management)) {
+        LOG_INFO("Traffic management antispam knobs unset, installing shipped defaults");
+        installAntispamDefaults(moduleConfig.traffic_management);
         saveToDisk(SEGMENT_MODULECONFIG);
     }
 
@@ -4555,10 +4590,20 @@ bool NodeDB::createNewIdentity()
     // The number has moved, so the caller must persist it whatever happens next. Returning false here
     // would leave the new key saved against the old number, which is the break this exists to prevent.
     meshtastic_NodeInfoLite *info = getOrCreateMeshNode(getNodeNum());
-    if (info)
+    if (info) {
         TypeConversions::CopyUserToNodeInfoLite(info, owner);
-    else
+        // Our row was appended, but index 0 is self by invariant: the phone's own-nodeinfo read and the
+        // demote/evict scans that skip index 0 to protect us both depend on it.
+        if (info != &meshNodes->at(0))
+            std::swap(meshNodes->at(0), *info);
+    } else
         LOG_ERROR("No room for our own node 0x%08x, identity moved without a self record", newNodeNum);
+
+    // Clients cache my_node_num from the handshake; the region set that mints the key never reboots.
+    if (service) {
+        service->identityGeneration++;
+        service->nudgeFromNum();
+    }
 
     return true;
 }
