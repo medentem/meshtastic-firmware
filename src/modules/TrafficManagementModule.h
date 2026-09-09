@@ -104,9 +104,15 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
         return exhaustRequested && exhaustRequestedFrom == getFrom(&mp) && exhaustRequestedId == mp.id;
     }
 
-    /// hop_limit for the relayed copy: min(original, probation cap). Untracked
-    /// senders stay capped; unsigned promotion does not lift the cap.
+    /// hop_limit for the relayed copy: min(original, probation cap, congestion cap).
+    /// Untracked senders stay capped; unsigned promotion does not lift the cap.
     uint8_t relayHopCap(const meshtastic_MeshPacket &mp) const;
+
+    /// True when this packet should be rebroadcast. False means deliver locally and skip TX.
+    bool shouldRelay(const meshtastic_MeshPacket &mp) const;
+
+    /// Charge one rebroadcast to the sender's relay budget; may gossip NO_RELAY.
+    void recordRelayed(const meshtastic_MeshPacket &mp);
 
     /// 0 anonymous, 1 signed, 2 neighbor-attested, 3 manual; untracked is 0.
     uint8_t trustLevelForTest(NodeNum node);
@@ -127,10 +133,17 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     uint8_t peekPromotedWindowTickForTest(NodeNum node);
     /// True when the subject currently holds a promotion.
     bool peekPromotedForTest(NodeNum node);
+    /// Windowed relayed-for count for `node`.
+    uint32_t peekRelayedCountForTest(NodeNum node);
+    /// True when gossiped or local NO_RELAY is in force.
+    bool peekNoRelayForTest(NodeNum node);
+    /// True when NO_RELAY came from local budget exhaustion.
+    bool peekNoRelayLocalForTest(NodeNum node);
     /// 0xFFFFFFFF = production (Time::getUptimeSecs() or test clock); otherwise the stored value.
     inline static uint32_t s_testUptimeSecs = 0xFFFFFFFFu;
     /// Pin antispam uptime for tests; pass 0xFFFFFFFF to restore production.
     static void setUptimeSecsForTest(uint32_t secs) { s_testUptimeSecs = secs; }
+    inline static int s_testCongestionPct = -1;
 
     // Injectable monotonic clock (ms): tests advance s_testNowMs instead of sleeping across
     // ticks (mirrors HopScalingModule); production reads Time::getMillis().
@@ -350,15 +363,20 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     bool nodeInfoSeeded = false;
     uint8_t sweepsSinceNodeInfoReconcile = 0;
 
-    /// Per-node greylist / signed-identity state. Separate from the 10-byte
-    /// unified cache: first-seen uptime and last-signed need real fields.
+    /// Per-node greylist / relay-budget / trust state. Separate from the 10-byte
+    /// unified cache: windowed counters and first-seen uptime need real fields.
     struct __attribute__((packed)) AntispamEntry {
         NodeNum node;
         uint32_t firstSeenSecs;  // uptime seconds; valid when hasFirstSeen
         uint32_t lastSignedSecs; // uptime of last verified signature; valid when hasLastSigned
         uint32_t promotedAtSecs; // uptime when the promotion lease was armed; 0 = permanent
-        uint8_t windowTick;      // 5-min nibble clock; valid when hasWindow
+        NodeNum noRelayClaimer;  // last gossip attester; 0 = local exhaustion
+        uint32_t noRelayClaimMs;
+        uint8_t relayedCount;
+        uint8_t windowTick; // 5-min nibble clock; valid when hasWindow
         uint8_t promoted : 1;
+        uint8_t noRelay : 1;
+        uint8_t noRelayLocal : 1;
         uint8_t trustLevel : 2; // 0 anonymous, 1 signed, 2 neighbor-attested, 3 manual
         uint8_t hasFirstSeen : 1;
         uint8_t hasLastSigned : 1;
@@ -366,7 +384,7 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
         uint8_t rssiClass;
         uint8_t channel;
     };
-    static_assert(sizeof(AntispamEntry) == 20, "AntispamEntry should be 20 bytes");
+    static_assert(sizeof(AntispamEntry) == 29, "AntispamEntry should be 29 bytes");
 
     /// Compiled antispam table size (min of unified cache and ANTISPAM_CACHE_SIZE).
     static constexpr uint16_t antispamCacheSize()
@@ -391,6 +409,12 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     bool noteFirstSeen(NodeNum node, uint8_t channel, uint8_t rssiClass, bool signedObserved);
     /// True when local observation is old enough to vouch for others.
     bool isEstablishedForVouching(NodeNum node) const;
+    /// True for ROUTING_APP / ADMIN_APP (always rebroadcast). want_ack and opaque frames are charged.
+    static bool relayBudgetExempt(const meshtastic_MeshPacket &mp);
+    /// Channel utilization percent, or s_testCongestionPct when pinned.
+    float currentCongestionPct() const;
+    /// Emit a hop_limit=1 NO_RELAY gossip for `subject`.
+    bool sendNoRelayGossip(NodeNum subject);
     /// Emit a hop_limit=1 KNOWN_SINCE gossip for `subject`.
     bool sendKnownSinceGossip(NodeNum subject);
     /// Handle an ID_ATTESTATION_APP packet (unsigned KNOWN_SINCE ends probation).
@@ -409,6 +433,10 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
     uint32_t l2FloorSecs() const;
     /// True when `attester` may raise `subject` to L2.
     bool l2VouchEligibleLocked(const AntispamEntry *subject, NodeNum attester, bool signedObserved) const;
+    /// Record a NO_RELAY claim from `attester` on `subject`.
+    void stampNoRelayClaimLocked(NodeNum attester, NodeNum subject, uint32_t nowMs);
+    /// Distinct live NO_RELAY claimers for `subject` (TTL-aware).
+    uint8_t noRelayClaimerCountLocked(NodeNum subject, uint32_t nowMs) const;
     /// Uptime seconds; tests may pin this via s_testUptimeSecs.
     uint32_t uptimeSecs() const;
     /// Quantize packet RSSI into a 4-class bucket.
@@ -442,6 +470,15 @@ class TrafficManagementModule : public MeshModule, private concurrency::OSThread
         uint8_t windowTick;
     };
     AttestQuorumCell attestQuorum[kAttestQuorumEntries] = {};
+
+    static constexpr uint16_t kNoRelayClaimEntries = 16;
+    struct NoRelayClaimCell {
+        NodeNum attester;
+        NodeNum subject;
+        uint8_t windowTick;
+        uint32_t claimMs;
+    };
+    NoRelayClaimCell noRelayClaims[kNoRelayClaimEntries] = {};
 
     uint32_t lastVouchSentMs = 0;
 
