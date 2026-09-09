@@ -209,6 +209,7 @@ class TrafficManagementModuleTestShim : public TrafficManagementModule
     using TrafficManagementModule::peekCachedRole;
     using TrafficManagementModule::peekNodeInfoFlagsForTest;
     using TrafficManagementModule::runOnce;
+    using TrafficManagementModule::trustLevelForTest;
 
     bool ignoreRequestFlag() const { return ignoreRequest; }
 };
@@ -4128,6 +4129,34 @@ static void test_tm_antispamMigration_zeroKnobsGetDefaults(void)
     TEST_ASSERT_NOT_EQUAL(kept, cfg.probation_window_secs);
 }
 
+static void test_tm_trustLadder_signedObservationStampsL1(void)
+{
+    TrafficManagementModuleTestShim module;
+    moduleConfig.traffic_management.probation_window_secs = 600;
+    moduleConfig.traffic_management.probation_max_hop_limit = 2;
+
+    meshtastic_MeshPacket unsignedPkt = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kRemoteNode);
+    unsignedPkt.hop_limit = 5;
+    unsignedPkt.xeddsa_signed = false;
+    (void)module.handleReceived(unsignedPkt);
+    TEST_ASSERT_EQUAL_UINT8(0, module.trustLevelForTest(kRemoteNode));
+    TEST_ASSERT_EQUAL_INT(1, module.peekProbationStateForTest(kRemoteNode));
+    TEST_ASSERT_EQUAL_UINT8(2, module.relayHopCap(unsignedPkt));
+
+    meshtastic_MeshPacket signedPkt = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kRemoteNode);
+    signedPkt.hop_limit = 5;
+    signedPkt.xeddsa_signed = true;
+    (void)module.handleReceived(signedPkt);
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kRemoteNode));
+    TEST_ASSERT_EQUAL_INT(1, module.peekProbationStateForTest(kRemoteNode));
+    TEST_ASSERT_EQUAL_UINT8(2, module.relayHopCap(signedPkt));
+
+    meshtastic_MeshPacket laterUnsigned = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kRemoteNode);
+    laterUnsigned.xeddsa_signed = false;
+    (void)module.handleReceived(laterUnsigned);
+    TEST_ASSERT_EQUAL_UINT8(1, module.trustLevelForTest(kRemoteNode));
+}
+
 } // namespace
 
 void setUp(void)
@@ -4280,6 +4309,7 @@ TM_TEST_ENTRY void setup()
     RUN_TEST(test_tm_tableFull_evictionPreservesEstablished);
     RUN_TEST(test_tm_knownSince_hopLimitIsOne);
     RUN_TEST(test_tm_antispamMigration_zeroKnobsGetDefaults);
+    RUN_TEST(test_tm_trustLadder_signedObservationStampsL1);
     exit(UNITY_END());
 }
 

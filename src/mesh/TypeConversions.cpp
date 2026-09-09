@@ -124,6 +124,7 @@ void TypeConversions::CopyUserToNodeInfoLite(meshtastic_NodeInfoLite *lite, cons
     nodeInfoLiteSetBit(lite, NODEINFO_BITFIELD_HAS_IS_UNMESSAGABLE_MASK, user.has_is_unmessagable);
     nodeInfoLiteSetBit(lite, NODEINFO_BITFIELD_IS_UNMESSAGABLE_MASK, user.has_is_unmessagable && user.is_unmessagable);
     nodeInfoLiteSetBit(lite, NODEINFO_BITFIELD_HAS_USER_MASK, true);
+    nodeInfoLiteSetBit(lite, NODEINFO_BITFIELD_IS_KEY_DERIVED_IDENTITY_MASK, storedIdentityIsKeyDerived(lite));
 }
 
 meshtastic_User TypeConversions::ConvertToUser(const meshtastic_NodeInfoLite *lite)

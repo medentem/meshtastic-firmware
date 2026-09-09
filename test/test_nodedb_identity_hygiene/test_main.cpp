@@ -108,6 +108,24 @@ void assertStoredKeyEquals(NodeNum num, uint8_t seed)
 
 } // namespace
 
+static const uint8_t KEY_DERIVED_KEY[32] = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA,
+                                            0xAB, 0xAC, 0xAD, 0xAE, 0xAF, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5,
+                                            0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF};
+static NodeNum keyDerivedNum()
+{
+    return (NodeNum)crc32Buffer(KEY_DERIVED_KEY, sizeof(KEY_DERIVED_KEY));
+}
+
+static meshtastic_User makeDerivedKeyUser(const char *longName, const char *shortName)
+{
+    meshtastic_User u = meshtastic_User_init_zero;
+    strncpy(u.long_name, longName, sizeof(u.long_name) - 1);
+    strncpy(u.short_name, shortName, sizeof(u.short_name) - 1);
+    u.public_key.size = 32;
+    memcpy(u.public_key.bytes, KEY_DERIVED_KEY, 32);
+    return u;
+}
+
 // --- addFromContact ---
 
 // The #11432 regression: a stored 32-byte key plus a contact with has_user=true
@@ -439,6 +457,78 @@ static void test_contact_key_guard_survives_reboot(void)
     TEST_ASSERT_TRUE(nodeInfoLiteIsKeyManuallyVerified(info)); // pin survives the reboot too
 }
 
+static void test_identity_predicate_keyDerivesNumber(void)
+{
+    const NodeNum num = keyDerivedNum();
+    TEST_ASSERT_TRUE(identityKeyDerivesNodeNum(KEY_DERIVED_KEY, num));
+    TEST_ASSERT_FALSE(identityKeyDerivesNodeNum(KEY_DERIVED_KEY, num + 1));
+    TEST_ASSERT_FALSE(identityKeyDerivesNodeNum(nullptr, num));
+
+    uint8_t legacy[32];
+    memset(legacy, 0x42, sizeof(legacy));
+    TEST_ASSERT_FALSE(identityKeyDerivesNodeNum(legacy, num));
+
+    meshtastic_NodeInfoLite stored = meshtastic_NodeInfoLite_init_zero;
+    stored.num = num;
+    memcpy(stored.public_key.bytes, legacy, 32);
+    stored.public_key.size = 32;
+    nodeInfoLiteSetBit(&stored, NODEINFO_BITFIELD_IS_KEY_DERIVED_IDENTITY_MASK, true);
+    TEST_ASSERT_FALSE(storedIdentityIsKeyDerived(&stored));
+    memcpy(stored.public_key.bytes, KEY_DERIVED_KEY, 32);
+    TEST_ASSERT_TRUE(storedIdentityIsKeyDerived(&stored));
+}
+
+static void test_identity_dualread_keyDerivedRefusesNonDeriving(void)
+{
+    const NodeNum num = keyDerivedNum();
+
+    meshtastic_User seed = makeDerivedKeyUser("Alice", "AL");
+    TEST_ASSERT_TRUE(db->updateUser(num, seed));
+    TEST_ASSERT_TRUE(nodeInfoLiteIsKeyDerivedIdentity(db->getMeshNode(num)));
+
+    meshtastic_User u = makeUser("Imposter", "IM", /*keySeed=*/0x42);
+    TEST_ASSERT_FALSE(db->updateUser(num, u));
+
+    TEST_ASSERT_TRUE(identityKeyDerivesNodeNum(db->getMeshNode(num)->public_key.bytes, num));
+    TEST_ASSERT_EQUAL_STRING("Alice", db->getMeshNode(num)->long_name);
+    TEST_ASSERT_TRUE(nodeInfoLiteIsKeyDerivedIdentity(db->getMeshNode(num)));
+}
+
+static void test_identity_dualread_transitionLegacyToKeyDerived(void)
+{
+    const NodeNum num = keyDerivedNum();
+    db->push(num, 1000, /*keySeed=*/0x42);
+    TEST_ASSERT_FALSE(nodeInfoLiteIsKeyDerivedIdentity(db->getMeshNode(num)));
+
+    db->commitRemoteKey(num, KEY_DERIVED_KEY, NodeDB::KeyCommitTrust::ManuallyVerified);
+
+    const meshtastic_NodeInfoLite *info = db->getMeshNode(num);
+    TEST_ASSERT_TRUE(identityKeyDerivesNodeNum(info->public_key.bytes, num));
+    TEST_ASSERT_TRUE(nodeInfoLiteIsKeyDerivedIdentity(info));
+
+    meshtastic_User u = makeUser("Imposter", "IM", /*keySeed=*/0x42);
+    TEST_ASSERT_FALSE(db->updateUser(num, u));
+    TEST_ASSERT_TRUE(identityKeyDerivesNodeNum(db->getMeshNode(num)->public_key.bytes, num));
+}
+
+static void test_identity_dualread_keylessUpdateAllowed(void)
+{
+    const NodeNum num = keyDerivedNum();
+
+    meshtastic_User keyless = makeUser("Alice", "AL");
+    TEST_ASSERT_TRUE(db->updateUser(num, keyless));
+    TEST_ASSERT_FALSE(nodeInfoLiteIsKeyDerivedIdentity(db->getMeshNode(num)));
+
+    meshtastic_NodeInfoLite anchored = meshtastic_NodeInfoLite_init_zero;
+    anchored.num = num;
+    memcpy(anchored.public_key.bytes, KEY_DERIVED_KEY, 32);
+    anchored.public_key.size = 32;
+    meshtastic_User stillKeyless = makeUser("Bob", "BO");
+    TEST_ASSERT_TRUE(incomingKeyMayBindIdentity(&anchored, stillKeyless, num));
+    meshtastic_User foreignKey = makeUser("Imposter", "IM", /*keySeed=*/0x42);
+    TEST_ASSERT_FALSE(incomingKeyMayBindIdentity(&anchored, foreignKey, num));
+}
+
 // --- Unity lifecycle ---
 
 void setUp(void)
@@ -503,6 +593,12 @@ IH_TEST_ENTRY void setup()
     RUN_TEST(test_updateuser_warm_signer_refusal_does_not_evict);
 #endif
 #endif
+
+    printf("\n=== identity dual-read ===\n");
+    RUN_TEST(test_identity_predicate_keyDerivesNumber);
+    RUN_TEST(test_identity_dualread_keyDerivedRefusesNonDeriving);
+    RUN_TEST(test_identity_dualread_transitionLegacyToKeyDerived);
+    RUN_TEST(test_identity_dualread_keylessUpdateAllowed);
 
     printf("\n=== persistence ===\n");
     RUN_TEST(test_contact_key_guard_survives_reboot);

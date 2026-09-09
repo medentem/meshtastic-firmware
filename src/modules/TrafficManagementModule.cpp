@@ -1236,7 +1236,7 @@ ProcessMessage TrafficManagementModule::handleReceived(const meshtastic_MeshPack
 
         // Antispam: track LoRa arrivals even if via_mqtt is set (that bit is unauthenticated).
         if (arrivedViaRadio(mp)) {
-            noteFirstSeen(mp.from, static_cast<uint8_t>(mp.channel), rssiClassOf(mp));
+            noteFirstSeen(mp.from, static_cast<uint8_t>(mp.channel), rssiClassOf(mp), mp.xeddsa_signed);
         }
         if (mp.decoded.portnum == meshtastic_PortNum_ID_ATTESTATION_APP) {
             if (handleIdAttestation(mp)) {
@@ -2020,7 +2020,7 @@ bool TrafficManagementModule::isEstablishedForVouching(NodeNum node) const
     return !inProbationLocked(entry);
 }
 
-bool TrafficManagementModule::noteFirstSeen(NodeNum node, uint8_t channel, uint8_t rssiClass)
+bool TrafficManagementModule::noteFirstSeen(NodeNum node, uint8_t channel, uint8_t rssiClass, bool signedObserved)
 {
     if (node == 0)
         return false;
@@ -2035,6 +2035,12 @@ bool TrafficManagementModule::noteFirstSeen(NodeNum node, uint8_t channel, uint8
     entry->channel = channel;
     if (rssiClass != 0xFF)
         entry->rssiClass = rssiClass;
+    if (signedObserved) {
+        if (entry->trustLevel == 0)
+            entry->trustLevel = 1;
+        entry->hasLastSigned = 1;
+        entry->lastSignedSecs = uptimeSecs();
+    }
     if (!isNew && entry->hasFirstSeen)
         return false;
     entry->hasFirstSeen = 1;
@@ -2057,6 +2063,13 @@ uint8_t TrafficManagementModule::rssiClassOf(const meshtastic_MeshPacket &mp)
     if (rssi >= -110)
         return 1;
     return 0;
+}
+
+uint8_t TrafficManagementModule::trustLevelForTest(NodeNum node)
+{
+    concurrency::LockGuard guard(&cacheLock);
+    const AntispamEntry *entry = findAntispamEntry(node);
+    return entry ? entry->trustLevel : 0;
 }
 
 int TrafficManagementModule::peekProbationStateForTest(NodeNum node)
