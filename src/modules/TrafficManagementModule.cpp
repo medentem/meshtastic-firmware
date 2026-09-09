@@ -1999,6 +1999,8 @@ bool TrafficManagementModule::inProbationLocked(const AntispamEntry *entry) cons
 
 bool TrafficManagementModule::hopCapAppliesLocked(const AntispamEntry *entry) const
 {
+    if (!antispam)
+        return false;
     const uint32_t windowSecs = moduleConfig.traffic_management.probation_window_secs;
     if (windowSecs == 0)
         return false;
